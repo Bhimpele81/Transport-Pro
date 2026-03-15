@@ -211,51 +211,114 @@ def parse_students_csv(csv_text: str) -> list[Student]:
 
 def parse_vehicles_text(text: str) -> list[dict]:
     """
-    Parse a block like:
+    Robustly parse vehicle config in many formats, e.g.:
         Vehicle A: Start: 7826 Loretto Ave, Philadelphia, PA - Capacity: 5 riders
-        Vehicle B: Start: 12 Rachel Rd, Richboro, PA - Capacity: 13 riders
-
+        Vehicle B Start: 12 Rachel Rd, Richboro, PA Capacity: up to 13 riders
+        Vehicles D\nStart: 1045 N West End Blvd, Quakertown PA - Capacity: up to 13 riders
+        E-H (5 vehicles)Start & End: 828 Elbow Lane - Capacity: up to 13 riders each
     Returns list of dicts: {name, start, capacity}
     """
-    vehicles = []
-    for line in text.strip().splitlines():
+    import re
+
+    # ----------------------------------------------------------------
+    # Pre-process: join continuation lines that don't start a new vehicle
+    # A "new vehicle" line starts with a vehicle name token like:
+    #   "Vehicle X", "Vehicles X", "Van X", a letter range "A-H", etc.
+    # ----------------------------------------------------------------
+    VEHICLE_NAME_RE = re.compile(
+        r"""^(?:
+            (?:vehicles?\s+[A-Z0-9][-–—\s,A-Z0-9]*)   # "Vehicle A" / "Vehicles D-H"
+          | (?:[A-Z][-–—][A-Z]\s*(?:\(|$))              # "E-H ("
+          | (?:[A-Z]\s*(?:\(|:|\s+Start))               # bare "A:" or "A Start"
+          | (?:Van\s+[A-Z0-9])                           # "Van A"
+        )""",
+        re.VERBOSE | re.IGNORECASE,
+    )
+
+    raw_lines = text.strip().splitlines()
+    merged_lines: list[str] = []
+    for raw in raw_lines:
+        stripped = raw.strip()
+        if not stripped:
+            continue
+        if merged_lines and not VEHICLE_NAME_RE.match(stripped):
+            # Continuation — glue onto previous line with a space
+            merged_lines[-1] = merged_lines[-1] + " " + stripped
+        else:
+            merged_lines.append(stripped)
+
+    # ----------------------------------------------------------------
+    # Expansion: handle grouped lines like
+    #   "E-H (5 vehicles) Start: 828 Elbow Lane - Capacity: 13 riders each"
+    # ----------------------------------------------------------------
+    RANGE_RE = re.compile(
+        r"""^(?:vehicles?\s*)?([A-Z])[-–—]([A-Z])   # letter range  A-H
+             (?:\s*\((\d+)\s*vehicles?\))?           # optional count
+        """,
+        re.VERBOSE | re.IGNORECASE,
+    )
+
+    def expand_range(line: str) -> list[str]:
+        """If the line describes a range of vehicles, expand into individual lines."""
+        m = RANGE_RE.match(line)
+        if not m:
+            return [line]
+        start_letter = m.group(1).upper()
+        end_letter = m.group(2).upper()
+        remainder = line[m.end():].strip().lstrip(":")
+        letters = [chr(c) for c in range(ord(start_letter), ord(end_letter) + 1)]
+        return [f"Vehicle {ltr}: {remainder}" for ltr in letters]
+
+    expanded_lines: list[str] = []
+    for line in merged_lines:
+        expanded_lines.extend(expand_range(line))
+
+    # ----------------------------------------------------------------
+    # Parse each (now-normalized) line
+    # ----------------------------------------------------------------
+    vehicles: list[dict] = []
+
+    for line in expanded_lines:
         line = line.strip()
         if not line:
             continue
-        try:
-            # Split on first colon to get name
-            if ":" not in line:
-                continue
-            name_part, rest = line.split(":", 1)
-            name = name_part.strip()
-            rest = rest.strip()
 
-            # Extract start address
-            start = ""
-            if "Start:" in rest:
-                start_part = rest.split("Start:")[1]
-                if " - Capacity" in start_part:
-                    start = start_part.split(" - Capacity")[0].strip()
-                elif "Capacity" in start_part:
-                    start = start_part.split("Capacity")[0].strip(" -").strip()
-                else:
-                    start = start_part.strip()
-
-            # Extract capacity
-            capacity = 13
-            if "Capacity:" in rest:
-                cap_str = rest.split("Capacity:")[1].strip().split()[0]
-                capacity = int("".join(c for c in cap_str if c.isdigit()) or "13")
-            elif "capacity" in rest.lower():
-                import re
-                m = re.search(r"(\d+)\s*riders?", rest, re.I)
-                if m:
-                    capacity = int(m.group(1))
-
-            if name and start:
-                vehicles.append({"name": name, "start": start, "capacity": capacity})
-        except Exception:
+        # --- Extract vehicle name ---
+        # Expect "Vehicle X:" or "Vehicles X Start:" or "Vehicle X Start &..."
+        name_m = re.match(
+            r"^((?:Vehicles?|Van)\s+[A-Z0-9]+)",
+            line,
+            re.IGNORECASE,
+        )
+        if not name_m:
+            # Try bare letter: "A: Start: ..."
+            name_m = re.match(r"^([A-Z])(?:\s*:|\s+Start)", line, re.IGNORECASE)
+        if not name_m:
             continue
+        raw_name = name_m.group(1).strip()
+        # Normalize: "Vehicles D" -> "Vehicle D"
+        name = re.sub(r"^Vehicles\b", "Vehicle", raw_name, flags=re.IGNORECASE)
+        rest = line[name_m.end():].strip().lstrip(":").strip()
+
+        # --- Extract start address ---
+        # Look for "Start:" or "Start &" or "Start and"
+        start_m = re.search(r"Start(?:\s*[&and]+\s*End)?\s*:?\s*", rest, re.IGNORECASE)
+        if not start_m:
+            continue
+        after_start = rest[start_m.end():]
+
+        # Address ends at " - Capacity", "Capacity", or end of string
+        addr_end = re.search(r"\s*[-]?\s*Capacity\b", after_start, re.IGNORECASE)
+        start_addr = after_start[:addr_end.start()].strip() if addr_end else after_start.strip()
+        # Clean trailing punctuation
+        start_addr = start_addr.rstrip(" -,")
+
+        # --- Extract capacity ---
+        cap_m = re.search(r"Capacity\s*:?\s*(?:up\s+to\s+)?(\d+)\s*riders?", rest, re.IGNORECASE)
+        capacity = int(cap_m.group(1)) if cap_m else 13
+
+        if name and start_addr:
+            vehicles.append({"name": name, "start": start_addr, "capacity": capacity})
 
     return vehicles
 
