@@ -1,14 +1,19 @@
 """
 Bus Route Optimizer for Elbow Lane Day Camp
-Generates optimized routes with geographic clustering and produces a formatted Excel file.
+============================================
+Uses OpenStreetMap Nominatim (free, no API key) to geocode every individual
+street address to exact lat/lon, then clusters students by true address-level
+proximity — completely ignoring ZIP codes.
 
-Usage:
-    python bus_route_optimizer.py \
-        --csv students.csv \
-        --vehicles "Vehicle A|7826 Loretto Ave, Philadelphia, PA|5,Vehicle B|12 Rachel Rd, Richboro, PA|13" \
-        --output routes_output.xlsx
+Dependencies:
+    pip install openpyxl geopy requests
 
-Or import and call generate_routes() directly.
+Usage (CLI):
+    python bus_route_optimizer.py --csv students.csv --vehicles vehicles.txt --output routes.xlsx
+
+Usage (import):
+    from bus_route_optimizer import generate_routes
+    generate_routes(csv_text, vehicles_text, "output.xlsx")
 """
 
 import argparse
@@ -16,16 +21,26 @@ import csv
 import io
 import json
 import math
-import sys
+import time
+import re
+import os
+import urllib.request
+import urllib.parse
 from dataclasses import dataclass, field
 from typing import Optional
 
 from openpyxl import Workbook
-from openpyxl.styles import (
-    Alignment, Border, Font, PatternFill, Side
-)
+from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+CAMP_ADDRESS  = "828 Elbow Lane, Warrington, PA 18976"
+CAMP_COORDS   = (40.2454, -75.1407)    # fallback if geocode fails
+GEOCACHE_FILE = "geocache.json"         # persists between runs to avoid re-geocoding
+NEIGHBOR_MI   = 1.5                     # addresses within 1.5 mi = candidate same-van
 
 # ---------------------------------------------------------------------------
 # Data structures
@@ -39,21 +54,22 @@ class Student:
     address: str
     city: str
     zip_code: str
+    lat: float = 0.0
+    lon: float = 0.0
+    geocoded: bool = False
 
     @property
     def full_address(self) -> str:
         return f"{self.address}, {self.city}, PA {self.zip_code}"
 
-    @property
-    def display_name(self) -> str:
-        return self.last
-
 
 @dataclass
 class Stop:
     address: str
-    riders: list[Student] = field(default_factory=list)
-    drive_time: str = ""        # e.g. "12 min" or "At start"
+    riders: list = field(default_factory=list)
+    drive_time: str = ""
+    lat: float = 0.0
+    lon: float = 0.0
 
     @property
     def rider_count(self) -> int:
@@ -61,13 +77,13 @@ class Stop:
 
     @property
     def rider_names(self) -> str:
+        seen: dict[str, int] = {}
+        for s in self.riders:
+            seen[s.last] = seen.get(s.last, 0) + 1
+        counters: dict[str, int] = {}
         names = []
-        seen_last = {}
         for s in self.riders:
-            seen_last[s.last] = seen_last.get(s.last, 0) + 1
-        counters = {}
-        for s in self.riders:
-            if seen_last[s.last] > 1:
+            if seen[s.last] > 1:
                 counters[s.last] = counters.get(s.last, 0) + 1
                 names.append(f"{s.last}{counters[s.last]}")
             else:
@@ -77,13 +93,15 @@ class Stop:
 
 @dataclass
 class Vehicle:
-    name: str               # "Vehicle A"
+    name: str
     start_address: str
     capacity: int
-    stops: list[Stop] = field(default_factory=list)
+    stops: list = field(default_factory=list)
     total_time: str = ""
     total_distance: str = ""
-    time_source: str = "Estimated"   # "Google Maps" or "Estimated"
+    time_source: str = "Estimated"
+    start_lat: float = 0.0
+    start_lon: float = 0.0
 
     @property
     def rider_count(self) -> int:
@@ -95,17 +113,14 @@ class Vehicle:
 
     @property
     def utilization_pct(self) -> int:
-        if self.capacity == 0:
-            return 0
-        return round(self.rider_count / self.capacity * 100)
+        return round(self.rider_count / self.capacity * 100) if self.capacity else 0
 
     @property
     def corridor(self) -> str:
-        """Short human-readable description of route corridor."""
-        cities = []
-        seen = set()
+        cities, seen = [], set()
         for stop in self.stops:
-            city = stop.address.split(",")[1].strip() if "," in stop.address else ""
+            parts = stop.address.split(",")
+            city = parts[1].strip() if len(parts) >= 3 else ""
             if city and city not in seen:
                 seen.add(city)
                 cities.append(city)
@@ -114,67 +129,111 @@ class Vehicle:
 
 
 # ---------------------------------------------------------------------------
-# Haversine distance (fallback when no API key)
+# Haversine — real distance between two GPS coordinates
 # ---------------------------------------------------------------------------
-
-# Approximate lat/lon for zip codes common to this dataset (Bucks/Montgomery County PA)
-ZIP_COORDS: dict[str, tuple[float, float]] = {
-    "18901": (40.3101, -75.1299),  # Doylestown
-    "18902": (40.2815, -75.0951),  # Doylestown (east)
-    "18914": (40.2868, -75.2066),  # Chalfont
-    "18929": (40.2501, -75.0835),  # Jamison
-    "18954": (40.2168, -74.9988),  # Richboro
-    "18974": (40.2312, -75.0629),  # Warwick/Ivyland
-    "18976": (40.2454, -75.1407),  # Warrington
-    "19002": (40.1557, -75.2271),  # Ambler/Maple Glen
-    "19025": (40.1390, -75.1771),  # Dresher
-    "19040": (40.1807, -75.1063),  # Hatboro
-    "19044": (40.1901, -75.1257),  # Horsham
-    "19090": (40.1485, -75.1202),  # Willow Grove
-    "19446": (40.2415, -75.2840),  # Lansdale
-    "19446-4443": (40.2415, -75.2840),
-    "19446-1677": (40.2415, -75.2840),
-    "19025": (40.1390, -75.1771),
-}
-
-DEST_COORDS = (40.2454, -75.1407)   # 828 Elbow Lane, Warrington PA
-
-
-def _zip5(z: str) -> str:
-    return z[:5]
-
 
 def haversine_mi(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     R = 3958.8
-    phi1, phi2 = math.radians(lat1), math.radians(lat2)
-    dphi = math.radians(lat2 - lat1)
-    dlam = math.radians(lon2 - lon1)
-    a = math.sin(dphi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlam / 2) ** 2
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    dp = math.radians(lat2 - lat1)
+    dl = math.radians(lon2 - lon1)
+    a = math.sin(dp/2)**2 + math.cos(p1)*math.cos(p2)*math.sin(dl/2)**2
     return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
 
 
-def approx_dist_mi(zip1: str, zip2: str) -> float:
-    c1 = ZIP_COORDS.get(_zip5(zip1))
-    c2 = ZIP_COORDS.get(_zip5(zip2))
-    if c1 and c2:
-        return haversine_mi(*c1, *c2)
-    return 999.0
+# ---------------------------------------------------------------------------
+# Geocoding — OpenStreetMap Nominatim (free, no API key required)
+# ---------------------------------------------------------------------------
+
+def _load_geocache() -> dict:
+    if os.path.exists(GEOCACHE_FILE):
+        try:
+            with open(GEOCACHE_FILE) as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {}
 
 
-def dist_to_dest(zip_code: str) -> float:
-    c = ZIP_COORDS.get(_zip5(zip_code))
-    if c:
-        return haversine_mi(*c, *DEST_COORDS)
-    return 999.0
+def _save_geocache(cache: dict) -> None:
+    try:
+        with open(GEOCACHE_FILE, "w") as f:
+            json.dump(cache, f, indent=2)
+    except Exception:
+        pass
+
+
+def geocode_address(address: str, cache: dict, progress_cb=None) -> tuple:
+    """
+    Geocode a single address to (lat, lon) using OpenStreetMap Nominatim.
+    - Free, no API key needed
+    - Results cached to disk so the same address is never looked up twice
+    - Nominatim requires max 1 request/second — enforced automatically
+    """
+    key = address.strip().lower()
+    if key in cache:
+        return tuple(cache[key])
+
+    if progress_cb:
+        progress_cb(f"  Geocoding: {address}")
+
+    try:
+        params = urllib.parse.urlencode({
+            "q": address,
+            "format": "json",
+            "limit": 1,
+            "addressdetails": 0,
+        })
+        url = f"https://nominatim.openstreetmap.org/search?{params}"
+        req = urllib.request.Request(url, headers={
+            # Nominatim requires a descriptive User-Agent
+            "User-Agent": "ElbowLaneCampBusRouter/1.0"
+        })
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            results = json.loads(resp.read().decode())
+
+        if results:
+            lat = float(results[0]["lat"])
+            lon = float(results[0]["lon"])
+            cache[key] = [lat, lon]
+            _save_geocache(cache)
+            time.sleep(1.1)   # Respect Nominatim rate limit: 1 req/sec
+            return lat, lon
+
+    except Exception as e:
+        if progress_cb:
+            progress_cb(f"  ⚠ Geocode failed for '{address}': {e}")
+
+    # Fallback: return camp coords so student doesn't crash the algorithm
+    return CAMP_COORDS
+
+
+def geocode_all_addresses(addresses: list, progress_cb=None) -> dict:
+    """
+    Geocode a list of unique addresses.
+    Returns dict: address_string -> (lat, lon)
+    Only calls the API for addresses not already in the cache.
+    """
+    cache = _load_geocache()
+    uncached = [a for a in addresses if a.strip().lower() not in cache]
+
+    if uncached and progress_cb:
+        progress_cb(f"Geocoding {len(uncached)} addresses via OpenStreetMap "
+                    f"(cached: {len(addresses) - len(uncached)}, "
+                    f"~{len(uncached)}s remaining)...")
+
+    result = {}
+    for addr in addresses:
+        result[addr] = geocode_address(addr, cache, progress_cb)
+
+    return result
 
 
 # ---------------------------------------------------------------------------
 # CSV parsing
 # ---------------------------------------------------------------------------
 
-def parse_students_csv(csv_text: str) -> list[Student]:
-    """Parse CSV text (or file path) into Student objects."""
-    # Accept file path or raw CSV text
+def parse_students_csv(csv_text: str) -> list:
     if "\n" not in csv_text and len(csv_text) < 300:
         try:
             with open(csv_text, newline="", encoding="utf-8-sig") as f:
@@ -185,23 +244,19 @@ def parse_students_csv(csv_text: str) -> list[Student]:
     students = []
     reader = csv.DictReader(io.StringIO(csv_text))
     for row in reader:
-        # Normalize column names (handle BOM, extra quotes, etc.)
         row = {k.strip().strip('"'): v.strip().strip('"') for k, v in row.items()}
         idx_key = next((k for k in row if k in ("", "idx", "#")), "")
         try:
             idx = int(row.get(idx_key, 0))
         except ValueError:
             idx = 0
-
-        last = row.get("Last name", row.get("last_name", ""))
-        first = row.get("First name", row.get("first_name", ""))
-        addr = row.get("Primary family address 1", row.get("address", ""))
-        city = row.get("Primary family city", row.get("city", ""))
-        zip_code = row.get("Primary family zip", row.get("zip", ""))
-
+        last     = row.get("Last name",               row.get("last_name",  ""))
+        first    = row.get("First name",              row.get("first_name", ""))
+        addr     = row.get("Primary family address 1", row.get("address",   ""))
+        city     = row.get("Primary family city",     row.get("city",       ""))
+        zip_code = row.get("Primary family zip",      row.get("zip",        ""))
         if last and addr:
             students.append(Student(idx, last, first, addr, city, zip_code))
-
     return students
 
 
@@ -209,111 +264,75 @@ def parse_students_csv(csv_text: str) -> list[Student]:
 # Vehicle config parsing
 # ---------------------------------------------------------------------------
 
-def parse_vehicles_text(text: str) -> list[dict]:
+def parse_vehicles_text(text: str) -> list:
     """
-    Robustly parse vehicle config in many formats, e.g.:
+    Handles many real-world formats:
         Vehicle A: Start: 7826 Loretto Ave, Philadelphia, PA - Capacity: 5 riders
         Vehicle B Start: 12 Rachel Rd, Richboro, PA Capacity: up to 13 riders
-        Vehicles D\nStart: 1045 N West End Blvd, Quakertown PA - Capacity: up to 13 riders
+        Vehicles D
+        Start: 1045 N West End Blvd, Quakertown PA - Capacity: up to 13 riders
         E-H (5 vehicles)Start & End: 828 Elbow Lane - Capacity: up to 13 riders each
-    Returns list of dicts: {name, start, capacity}
     """
-    import re
-
-    # ----------------------------------------------------------------
-    # Pre-process: join continuation lines that don't start a new vehicle
-    # A "new vehicle" line starts with a vehicle name token like:
-    #   "Vehicle X", "Vehicles X", "Van X", a letter range "A-H", etc.
-    # ----------------------------------------------------------------
-    VEHICLE_NAME_RE = re.compile(
+    VEHICLE_START_RE = re.compile(
         r"""^(?:
-            (?:vehicles?\s+[A-Z0-9][-–—\s,A-Z0-9]*)   # "Vehicle A" / "Vehicles D-H"
-          | (?:[A-Z][-–—][A-Z]\s*(?:\(|$))              # "E-H ("
-          | (?:[A-Z]\s*(?:\(|:|\s+Start))               # bare "A:" or "A Start"
-          | (?:Van\s+[A-Z0-9])                           # "Van A"
-        )""",
-        re.VERBOSE | re.IGNORECASE,
+            (?:vehicles?\s+[A-Z0-9][-\s,A-Z0-9]*)
+          | (?:[A-Z][-][A-Z]\s*(?:\(|$))
+          | (?:[A-Z]\s*(?:\(|:|\s+Start))
+          | (?:Van\s+[A-Z0-9])
+        )""", re.VERBOSE | re.IGNORECASE,
     )
 
-    raw_lines = text.strip().splitlines()
-    merged_lines: list[str] = []
-    for raw in raw_lines:
-        stripped = raw.strip()
-        if not stripped:
+    # Merge continuation lines
+    merged = []
+    for raw in text.strip().splitlines():
+        s = raw.strip()
+        if not s:
             continue
-        if merged_lines and not VEHICLE_NAME_RE.match(stripped):
-            # Continuation — glue onto previous line with a space
-            merged_lines[-1] = merged_lines[-1] + " " + stripped
+        if merged and not VEHICLE_START_RE.match(s):
+            merged[-1] += " " + s
         else:
-            merged_lines.append(stripped)
+            merged.append(s)
 
-    # ----------------------------------------------------------------
-    # Expansion: handle grouped lines like
-    #   "E-H (5 vehicles) Start: 828 Elbow Lane - Capacity: 13 riders each"
-    # ----------------------------------------------------------------
+    # Expand letter ranges (e.g. "E-H")
     RANGE_RE = re.compile(
-        r"""^(?:vehicles?\s*)?([A-Z])[-–—]([A-Z])   # letter range  A-H
-             (?:\s*\((\d+)\s*vehicles?\))?           # optional count
-        """,
-        re.VERBOSE | re.IGNORECASE,
+        r"^(?:vehicles?\s*)?([A-Z])[-]([A-Z])(?:\s*\(\d+\s*vehicles?\))?",
+        re.IGNORECASE,
     )
-
-    def expand_range(line: str) -> list[str]:
-        """If the line describes a range of vehicles, expand into individual lines."""
+    expanded = []
+    for line in merged:
         m = RANGE_RE.match(line)
-        if not m:
-            return [line]
-        start_letter = m.group(1).upper()
-        end_letter = m.group(2).upper()
-        remainder = line[m.end():].strip().lstrip(":")
-        letters = [chr(c) for c in range(ord(start_letter), ord(end_letter) + 1)]
-        return [f"Vehicle {ltr}: {remainder}" for ltr in letters]
+        if m:
+            sl, el = m.group(1).upper(), m.group(2).upper()
+            remainder = line[m.end():].strip().lstrip(":")
+            for c in range(ord(sl), ord(el) + 1):
+                expanded.append(f"Vehicle {chr(c)}: {remainder}")
+        else:
+            expanded.append(line)
 
-    expanded_lines: list[str] = []
-    for line in merged_lines:
-        expanded_lines.extend(expand_range(line))
-
-    # ----------------------------------------------------------------
-    # Parse each (now-normalized) line
-    # ----------------------------------------------------------------
-    vehicles: list[dict] = []
-
-    for line in expanded_lines:
+    vehicles = []
+    for line in expanded:
         line = line.strip()
         if not line:
             continue
 
-        # --- Extract vehicle name ---
-        # Expect "Vehicle X:" or "Vehicles X Start:" or "Vehicle X Start &..."
-        name_m = re.match(
-            r"^((?:Vehicles?|Van)\s+[A-Z0-9]+)",
-            line,
-            re.IGNORECASE,
-        )
+        name_m = re.match(r"^((?:Vehicles?|Van)\s+[A-Z0-9]+)", line, re.IGNORECASE)
         if not name_m:
-            # Try bare letter: "A: Start: ..."
             name_m = re.match(r"^([A-Z])(?:\s*:|\s+Start)", line, re.IGNORECASE)
         if not name_m:
             continue
+
         raw_name = name_m.group(1).strip()
-        # Normalize: "Vehicles D" -> "Vehicle D"
         name = re.sub(r"^Vehicles\b", "Vehicle", raw_name, flags=re.IGNORECASE)
         rest = line[name_m.end():].strip().lstrip(":").strip()
 
-        # --- Extract start address ---
-        # Look for "Start:" or "Start &" or "Start and"
-        start_m = re.search(r"Start(?:\s*[&and]+\s*End)?\s*:?\s*", rest, re.IGNORECASE)
+        start_m = re.search(r"Start(?:\s*[&]\s*End)?\s*:?\s*", rest, re.IGNORECASE)
         if not start_m:
             continue
-        after_start = rest[start_m.end():]
+        after = rest[start_m.end():]
 
-        # Address ends at " - Capacity", "Capacity", or end of string
-        addr_end = re.search(r"\s*[-]?\s*Capacity\b", after_start, re.IGNORECASE)
-        start_addr = after_start[:addr_end.start()].strip() if addr_end else after_start.strip()
-        # Clean trailing punctuation
-        start_addr = start_addr.rstrip(" -,")
+        addr_end = re.search(r"\s*[-]?\s*Capacity\b", after, re.IGNORECASE)
+        start_addr = (after[:addr_end.start()].strip() if addr_end else after.strip()).rstrip(" -,")
 
-        # --- Extract capacity ---
         cap_m = re.search(r"Capacity\s*:?\s*(?:up\s+to\s+)?(\d+)\s*riders?", rest, re.IGNORECASE)
         capacity = int(cap_m.group(1)) if cap_m else 13
 
@@ -324,203 +343,194 @@ def parse_vehicles_text(text: str) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
-# Core routing algorithm
+# Core routing — real address geocoding, ZIP codes never used
 # ---------------------------------------------------------------------------
 
-def _extract_zip_from_address(addr: str) -> str:
-    """Extract 5-digit ZIP from a full address string."""
-    import re
-    m = re.search(r"\b(\d{5})\b", addr)
-    return m.group(1) if m else ""
-
-
-def _vehicle_start_zip(veh: "Vehicle") -> str:
-    return _extract_zip_from_address(veh.start_address)
-
-
-def _stop_zip(stop: "Stop") -> str:
-    return _extract_zip_from_address(stop.address)
-
-
-def cluster_students(students: list[Student], vehicles: list[dict]) -> list[Vehicle]:
+def cluster_and_route(students: list, vehicles: list, progress_cb=None) -> list:
     """
-    Assign students to vehicles using geographic clustering:
-    1. Families (same address) stay together
-    2. Addresses sharing same ZIP code (or ZIPs within 1.5mi) cluster together
-    3. Clusters assigned to vehicle whose start is geographically closest
-    4. Stops ordered furthest-from-camp first (no backtracking)
+    Full routing pipeline:
+    1. Geocode every unique street address to exact lat/lon (OpenStreetMap)
+    2. Cluster students by TRUE address proximity (<1.5 mi between houses)
+       ZIP codes are completely ignored
+    3. Assign clusters to vehicles by nearest start location (strict capacity)
+    4. Sequence stops furthest-from-camp first within each vehicle
     """
-    # --- Step 1: Group by exact address ---
-    addr_groups: dict[str, list[Student]] = {}
+
+    # ── 1. Geocode all addresses ──────────────────────────────────────────
+    unique_student_addrs = list({s.full_address for s in students})
+    vehicle_start_addrs  = [v["start"] for v in vehicles]
+    all_addrs = list({*unique_student_addrs, *vehicle_start_addrs, CAMP_ADDRESS})
+
+    coords = geocode_all_addresses(all_addrs, progress_cb)
+
+    camp_lat, camp_lon = coords.get(CAMP_ADDRESS, CAMP_COORDS)
+
+    # Attach real coordinates to each student
     for s in students:
-        key = s.address.lower().strip()
-        addr_groups.setdefault(key, []).append(s)
+        lat, lon = coords.get(s.full_address, CAMP_COORDS)
+        s.lat, s.lon = lat, lon
+        s.geocoded = (lat, lon) != CAMP_COORDS
+
+    geocoded_count = sum(1 for s in students if s.geocoded)
+    if progress_cb:
+        progress_cb(f"Geocoded {geocoded_count}/{len(students)} student addresses successfully")
+
+    # ── 2. Group exact-same-address students (families) ──────────────────
+    addr_groups: dict = {}
+    for s in students:
+        addr_groups.setdefault(s.address.lower().strip(), []).append(s)
     family_units = list(addr_groups.values())
 
-    def unit_zip(unit: list[Student]) -> str:
-        return _zip5(unit[0].zip_code)
+    def unit_coords(unit):
+        return unit[0].lat, unit[0].lon
 
-    # --- Step 2: Cluster family units by geographic proximity ---
-    NEIGHBOR_THRESHOLD_MI = 2.0  # slightly larger for zip-centroid approximation
-    clusters: list[list[list[Student]]] = []
+    def dist_to_camp(unit):
+        lat, lon = unit_coords(unit)
+        return haversine_mi(lat, lon, camp_lat, camp_lon)
 
+    # ── 3. Cluster by true address-level proximity (NO ZIP logic) ────────
+    #
+    # For every family unit, find the existing cluster that contains an
+    # address within NEIGHBOR_MI miles. If none found, start a new cluster.
+    # This means two houses 0.4 mi apart in different ZIPs → same cluster.
+    # Two houses 3 mi apart in the same ZIP → different clusters.
+    #
+    clusters: list = []
     for unit in family_units:
-        z = unit_zip(unit)
-        assigned = False
-        for cluster in clusters:
+        ulat, ulon = unit_coords(unit)
+        best_ci   = None
+        best_dist = float("inf")
+
+        for ci, cluster in enumerate(clusters):
             for existing_unit in cluster:
-                ez = unit_zip(existing_unit)
-                # Same zip = definitely neighbors
-                if ez == z or approx_dist_mi(z, ez) <= NEIGHBOR_THRESHOLD_MI:
-                    cluster.append(unit)
-                    assigned = True
-                    break
-            if assigned:
-                break
-        if not assigned:
+                elat, elon = unit_coords(existing_unit)
+                d = haversine_mi(ulat, ulon, elat, elon)
+                if d <= NEIGHBOR_MI and d < best_dist:
+                    best_dist = d
+                    best_ci   = ci
+
+        if best_ci is not None:
+            clusters[best_ci].append(unit)
+        else:
             clusters.append([unit])
 
-    # --- Step 3: Build Vehicle objects ---
-    veh_objects: list[Vehicle] = [
-        Vehicle(name=v["name"], start_address=v["start"], capacity=v["capacity"])
-        for v in vehicles
-    ]
+    if progress_cb:
+        progress_cb(f"Formed {len(clusters)} geographic clusters "
+                    f"(threshold: {NEIGHBOR_MI} mi between actual addresses)")
 
-    # --- Step 2.5: Flatten clusters to individual family units for fine-grained assignment ---
-    # We do NOT pre-aggregate into clusters; instead assign each family unit individually
-    # so we can strictly respect each vehicle's specific capacity.
-    # Sort family units: farthest from camp first (so distant riders get placed first)
-    all_units: list[list[Student]] = sorted(
-        family_units,
-        key=lambda u: dist_to_dest(unit_zip(u)),
-        reverse=True,
-    )
+    # ── 4. Build Vehicle objects with geocoded start coords ───────────────
+    veh_objects = []
+    for v in vehicles:
+        lat, lon = coords.get(v["start"], CAMP_COORDS)
+        veh_objects.append(Vehicle(
+            name=v["name"], start_address=v["start"], capacity=v["capacity"],
+            start_lat=lat, start_lon=lon,
+        ))
 
-    # --- Step 4: Assign family units to vehicles with STRICT capacity enforcement ---
-    vehicle_assignments: list[list[list[Student]]] = [[] for _ in veh_objects]
-    vehicle_counts = [0] * len(veh_objects)
+    # ── 5. Assign family units to vehicles ────────────────────────────────
+    # Sort farthest-from-camp first so distant students get priority placement
+    all_units = sorted(family_units, key=dist_to_camp, reverse=True)
 
-    def best_vehicle_for_unit(unit: list[Student], counts: list[int]) -> int:
-        """Return index of best vehicle for this unit (closest start, strict cap)."""
-        uz = unit_zip(unit)
-        unit_size = len(unit)
-        best_vi = None
-        best_score = float("inf")
-        for vi, veh in enumerate(veh_objects):
-            remaining = veh.capacity - counts[vi]
-            if remaining < unit_size:
-                continue  # HARD CAP: no room
-            vz = _vehicle_start_zip(veh)
-            geo = approx_dist_mi(uz, vz) if (uz and vz) else 10.0
-            # Small bonus for vehicles that already have nearby riders (promotes clustering)
-            existing_zips = [
-                unit_zip(eu)
-                for eu in vehicle_assignments[vi]
-            ]
-            neighbor_bonus = 0.0
-            if existing_zips:
-                min_existing_dist = min(
-                    approx_dist_mi(uz, ez) for ez in existing_zips if ez
-                ) if existing_zips else 99.0
-                neighbor_bonus = -min(2.0, max(0.0, 2.0 - min_existing_dist))
-            score = geo + neighbor_bonus
-            if score < best_score:
-                best_score = score
-                best_vi = vi
-        return best_vi  # may be None if truly all full
+    assignments: list = [[] for _ in veh_objects]
+    counts      = [0]  * len(veh_objects)
 
-    # Two-pass: first pass respects geography; second pass fills any stragglers
-    unplaced: list[list[Student]] = []
+    def score(unit, vi) -> float:
+        """Score vehicle vi for this unit. Lower = better. inf = full."""
+        remaining = veh_objects[vi].capacity - counts[vi]
+        if remaining < len(unit):
+            return float("inf")   # HARD CAP — never exceed capacity
+        ulat, ulon = unit_coords(unit)
+        # Base score: distance from this address to vehicle's start
+        geo = haversine_mi(ulat, ulon, veh_objects[vi].start_lat, veh_objects[vi].start_lon)
+        # Clustering bonus: reward keeping nearby students on the same van
+        if assignments[vi]:
+            nearest = min(
+                haversine_mi(ulat, ulon, *unit_coords(eu))
+                for eu in assignments[vi]
+            )
+            geo -= min(2.0, max(0.0, 2.0 - nearest))
+        return geo
+
+    unplaced = []
     for unit in all_units:
-        vi = best_vehicle_for_unit(unit, vehicle_counts)
-        if vi is not None:
-            vehicle_assignments[vi].append(unit)
-            vehicle_counts[vi] += len(unit)
+        best = min(range(len(veh_objects)), key=lambda vi: score(unit, vi))
+        if score(unit, best) < float("inf"):
+            assignments[best].append(unit)
+            counts[best] += len(unit)
         else:
             unplaced.append(unit)
 
-    # Second pass: place unplaced units in the vehicle with most remaining room
+    # Second pass: place stragglers in vehicle with most remaining space
     for unit in unplaced:
-        unit_size = len(unit)
-        # Find vehicle with most remaining capacity that can still fit this unit
+        size = len(unit)
         candidates = [
-            (veh_objects[vi].capacity - vehicle_counts[vi], vi)
+            (veh_objects[vi].capacity - counts[vi], vi)
             for vi in range(len(veh_objects))
-            if veh_objects[vi].capacity - vehicle_counts[vi] >= unit_size
+            if veh_objects[vi].capacity - counts[vi] >= size
         ]
-        if candidates:
-            vi = max(candidates)[1]
-        else:
-            # Absolute last resort: least-over-capacity vehicle
-            vi = min(range(len(veh_objects)), key=lambda i: vehicle_counts[i])
-        vehicle_assignments[vi].append(unit)
-        vehicle_counts[vi] += unit_size
+        vi = max(candidates)[1] if candidates else min(
+            range(len(veh_objects)), key=lambda i: counts[i]
+        )
+        assignments[vi].append(unit)
+        counts[vi] += size
 
-    # --- Step 5: Build stops and sequence them ---
+    # ── 6. Sequence stops: furthest from camp first (no backtracking) ─────
     for vi, veh in enumerate(veh_objects):
-        assigned_clusters = vehicle_assignments[vi]
-        if not assigned_clusters:
+        if not assignments[vi]:
             veh.total_time = "—"
             veh.total_distance = "—"
             continue
 
-        # Aggregate family units into address-keyed stops
-        # vehicle_assignments[vi] is a flat list of family units (lists of Student)
-        addr_stop: dict[str, Stop] = {}
-        for unit in assigned_clusters:
+        # Build address-level stops
+        addr_stop: dict = {}
+        for unit in assignments[vi]:
             rep = unit[0]
             key = rep.address.lower().strip()
             if key not in addr_stop:
-                addr_stop[key] = Stop(address=rep.full_address)
+                addr_stop[key] = Stop(address=rep.full_address, lat=rep.lat, lon=rep.lon)
             addr_stop[key].riders.extend(unit)
 
-        # Sort: furthest from destination first
+        # Order stops: farthest house from camp goes first
         sorted_stops = sorted(
             addr_stop.values(),
-            key=lambda s: dist_to_dest(_stop_zip(s)),
-            reverse=True
+            key=lambda s: haversine_mi(s.lat, s.lon, camp_lat, camp_lon),
+            reverse=True,
         )
 
-        # Compute sequential leg drive times
-        prev_zip = _vehicle_start_zip(veh)
+        # Drive times between consecutive stops (using real coordinates)
+        prev_lat, prev_lon = veh.start_lat, veh.start_lon
         for i, stop in enumerate(sorted_stops):
-            sz = _stop_zip(stop)
-            d = approx_dist_mi(prev_zip, sz) if (prev_zip and sz) else 5.0
-            mins = max(2, round(d * 3.0))  # ~3 min/mile suburban PA
+            d    = haversine_mi(prev_lat, prev_lon, stop.lat, stop.lon)
+            mins = max(2, round(d * 3.0))   # ~3 min/mile for suburban PA roads
             stop.drive_time = f"{mins} min from start" if i == 0 else f"{mins} min"
-            prev_zip = sz or prev_zip
+            prev_lat, prev_lon = stop.lat, stop.lon
 
         veh.stops = sorted_stops
 
-        # Total route time (sum of legs + final leg to camp)
-        total_mins = 0
-        for stop in sorted_stops:
-            t = stop.drive_time.replace(" min from start", "").replace(" min", "").strip()
-            if t.isdigit():
-                total_mins += int(t)
-
-        last_zip = _stop_zip(sorted_stops[-1]) if sorted_stops else ""
-        final_leg = max(3, round(approx_dist_mi(last_zip, "18976") * 3.0)) if last_zip else 12
-        total_mins += final_leg
+        # Total route time
+        total_mins = sum(
+            int(s.drive_time.replace(" min from start", "").replace(" min", ""))
+            for s in sorted_stops
+            if s.drive_time.replace(" min from start", "").replace(" min", "").isdigit()
+        )
+        last = sorted_stops[-1]
+        total_mins += max(3, round(haversine_mi(last.lat, last.lon, camp_lat, camp_lon) * 3.0))
 
         if total_mins >= 60:
-            hrs, mins_rem = divmod(total_mins, 60)
-            veh.total_time = f"{hrs} hr {mins_rem} min *" if mins_rem else f"{hrs} hr *"
+            hrs, rem = divmod(total_mins, 60)
+            veh.total_time = f"{hrs} hr {rem} min *" if rem else f"{hrs} hr *"
         else:
             veh.total_time = f"{total_mins} min *"
 
         # Total distance
-        total_dist = 0.0
-        pz = _vehicle_start_zip(veh)
+        dist = 0.0
+        plat, plon = veh.start_lat, veh.start_lon
         for stop in sorted_stops:
-            sz = _stop_zip(stop)
-            if pz and sz:
-                total_dist += approx_dist_mi(pz, sz)
-            pz = sz or pz
-        if last_zip:
-            total_dist += approx_dist_mi(last_zip, "18976")
-        veh.total_distance = f"{round(total_dist, 1)} mi"
-        veh.time_source = "Estimated"
+            dist += haversine_mi(plat, plon, stop.lat, stop.lon)
+            plat, plon = stop.lat, stop.lon
+        dist += haversine_mi(plat, plon, camp_lat, camp_lon)
+        veh.total_distance = f"{round(dist, 1)} mi"
+        veh.time_source    = "Estimated"
 
     return veh_objects
 
@@ -529,304 +539,211 @@ def cluster_students(students: list[Student], vehicles: list[dict]) -> list[Vehi
 # Excel generation
 # ---------------------------------------------------------------------------
 
-CAMP_BLUE = "1F497D"
-HEADER_GOLD = "C6EFCE"
-LIGHT_BLUE = "DDEEFF"
-LIGHT_GRAY = "F2F2F2"
-GREEN_FILL = "E2EFDA"
+CAMP_BLUE   = "1F497D"
+LIGHT_BLUE  = "DDEEFF"
+LIGHT_GRAY  = "F2F2F2"
+GREEN_FILL  = "E2EFDA"
 YELLOW_FILL = "FFEB9C"
-WHITE = "FFFFFF"
-DARK_TEXT = "1A1A1A"
-MEDIUM_BORDER = Side(style="medium", color="1F497D")
-THIN_BORDER = Side(style="thin", color="AAAAAA")
+WHITE       = "FFFFFF"
+DARK_TEXT   = "1A1A1A"
+MED_SIDE    = Side(style="medium", color="1F497D")
+THIN_SIDE   = Side(style="thin",   color="AAAAAA")
 
 
-def _border(top=None, bottom=None, left=None, right=None):
-    return Border(top=top, bottom=bottom, left=left, right=right)
-
-
-def _fill(hex_color: str):
-    return PatternFill("solid", start_color=hex_color, fgColor=hex_color)
-
-
+def _fill(c):  return PatternFill("solid", start_color=c, fgColor=c)
 def _font(bold=False, size=11, color=DARK_TEXT, italic=False):
     return Font(name="Arial", bold=bold, size=size, color=color, italic=italic)
-
-
 def _align(h="left", v="center", wrap=False):
     return Alignment(horizontal=h, vertical=v, wrap_text=wrap)
+def _border(**kw): return Border(**kw)
 
 
-def _set_row(ws, row, values, fonts=None, fills=None, aligns=None, heights=None):
-    for ci, val in enumerate(values, 1):
-        cell = ws.cell(row=row, column=ci, value=val)
-        if fonts and ci <= len(fonts) and fonts[ci - 1]:
-            cell.font = fonts[ci - 1]
-        if fills and ci <= len(fills) and fills[ci - 1]:
-            cell.fill = fills[ci - 1]
-        if aligns and ci <= len(aligns) and aligns[ci - 1]:
-            cell.alignment = aligns[ci - 1]
-
-
-def build_dashboard(wb: Workbook, vehicles: list[Vehicle]):
+def build_dashboard(wb: Workbook, vehicles: list):
     ws = wb.active
     ws.title = "Route Summary"
+    for col, w in zip("ABCDEFGH", [18, 54, 10, 10, 9, 14, 13, 14]):
+        ws.column_dimensions[col].width = w
 
-    ws.column_dimensions["A"].width = 18
-    ws.column_dimensions["B"].width = 52
-    ws.column_dimensions["C"].width = 10
-    ws.column_dimensions["D"].width = 10
-    ws.column_dimensions["E"].width = 9
-    ws.column_dimensions["F"].width = 14
-    ws.column_dimensions["G"].width = 13
-    ws.column_dimensions["H"].width = 14
-
-    # Row 1: Title
+    # Row 1: title
     ws.merge_cells("A1:H1")
     c = ws["A1"]
-    c.value = "🚌  Elbow Lane Day Camp — Vehicle Route Plan"
-    c.font = _font(bold=True, size=16, color=WHITE)
-    c.fill = _fill(CAMP_BLUE)
+    c.value     = "🚌  Elbow Lane Day Camp — Vehicle Route Plan"
+    c.font      = _font(bold=True, size=16, color=WHITE)
+    c.fill      = _fill(CAMP_BLUE)
     c.alignment = _align("center")
     ws.row_dimensions[1].height = 32
 
-    # Row 2: Subtitle
+    # Row 2: subtitle
     ws.merge_cells("A2:H2")
     c = ws["A2"]
-    c.value = (
-        "All vehicles finish at: 828 Elbow Lane, Warrington, PA  |  "
-        "Times marked * are estimates based on road network knowledge; "
-        "others confirmed via Google Maps"
-    )
-    c.font = _font(size=9, italic=True, color="444444")
-    c.fill = _fill(LIGHT_BLUE)
+    c.value = ("All vehicles finish at: 828 Elbow Lane, Warrington, PA  |  "
+               "Clustered by real street-address proximity (OpenStreetMap)  |  "
+               "Times marked * are estimates")
+    c.font      = _font(size=9, italic=True, color="444444")
+    c.fill      = _fill(LIGHT_BLUE)
     c.alignment = _align("center")
     ws.row_dimensions[2].height = 18
 
-    # Row 3: Headers
-    headers = ["Vehicle", "Starting Point / Route Corridor", "Capacity", "Riders", "Stops", "Est. Time", "Distance", "Source"]
-    for ci, h in enumerate(headers, 1):
+    # Row 3: headers
+    hdrs = ["Vehicle","Starting Point / Route Corridor",
+            "Capacity","Riders","Stops","Est. Time","Distance","Source"]
+    for ci, h in enumerate(hdrs, 1):
         cell = ws.cell(row=3, column=ci, value=h)
-        cell.font = _font(bold=True, size=10, color=WHITE)
-        cell.fill = _fill(CAMP_BLUE)
+        cell.font      = _font(bold=True, size=10, color=WHITE)
+        cell.fill      = _fill(CAMP_BLUE)
         cell.alignment = _align("center")
-        cell.border = _border(
-            bottom=MEDIUM_BORDER, top=MEDIUM_BORDER,
-            left=THIN_BORDER, right=THIN_BORDER
-        )
+        cell.border    = _border(bottom=MED_SIDE, top=MED_SIDE,
+                                 left=THIN_SIDE,  right=THIN_SIDE)
     ws.row_dimensions[3].height = 18
 
-    # Rows 4+: Vehicle data
-    total_capacity = 0
-    total_riders = 0
+    total_cap = total_riders = 0
     for ri, veh in enumerate(vehicles):
         row = 4 + ri
-        fill = _fill(WHITE) if ri % 2 == 0 else _fill(LIGHT_GRAY)
-        is_confirmed = veh.time_source == "Google Maps"
-        time_fill = _fill(GREEN_FILL) if is_confirmed else _fill(YELLOW_FILL)
-
-        corridor = f"{veh.start_address}  |  {veh.corridor}"
-
-        cells_vals = [
-            veh.name,
-            corridor,
-            veh.capacity,
-            f"=SUM({get_column_letter(4)}{row}:{get_column_letter(4)}{row})",
-            veh.stop_count,
-            veh.total_time,
-            veh.total_distance,
-            veh.time_source,
-        ]
-        # Write raw data (not formula for riders - just count)
-        cells_vals[3] = veh.rider_count
-
-        for ci, val in enumerate(cells_vals, 1):
+        bg   = _fill(WHITE) if ri % 2 == 0 else _fill(LIGHT_GRAY)
+        tfill = _fill(GREEN_FILL if veh.time_source == "Google Maps" else YELLOW_FILL)
+        vals = [veh.name,
+                f"{veh.start_address}  |  {veh.corridor}",
+                veh.capacity, veh.rider_count, veh.stop_count,
+                veh.total_time, veh.total_distance, veh.time_source]
+        for ci, val in enumerate(vals, 1):
             cell = ws.cell(row=row, column=ci, value=val)
-            cell.font = _font(size=10)
-            cell.fill = time_fill if ci == 6 else fill
-            cell.alignment = _align("center" if ci != 2 else "left")
-            cell.border = _border(bottom=Side(style="thin", color="CCCCCC"))
-
-        total_capacity += veh.capacity
+            cell.font      = _font(size=10)
+            cell.fill      = tfill if ci == 6 else bg
+            cell.alignment = _align("left" if ci == 2 else "center")
+            cell.border    = _border(bottom=Side(style="thin", color="CCCCCC"))
+        total_cap    += veh.capacity
         total_riders += veh.rider_count
         ws.row_dimensions[row].height = 15
 
-    # Total row
-    total_row = 4 + len(vehicles)
-    ws.merge_cells(f"A{total_row}:B{total_row}")
-    label_cell = ws.cell(
-        row=total_row, column=1,
-        value=f"TOTAL  ({total_riders} riders / {total_capacity} capacity / {len(vehicles)} vehicles)"
-    )
-    label_cell.font = _font(bold=True, size=10, color=WHITE)
-    label_cell.fill = _fill(CAMP_BLUE)
-    label_cell.alignment = _align("center")
-
-    cap_cell = ws.cell(row=total_row, column=3, value=total_capacity)
-    cap_cell.font = _font(bold=True, color=WHITE)
-    cap_cell.fill = _fill(CAMP_BLUE)
-    cap_cell.alignment = _align("center")
-
-    rider_cell = ws.cell(row=total_row, column=4, value=f"=SUM(D4:D{total_row - 1})")
-    rider_cell.font = _font(bold=True, color=WHITE)
-    rider_cell.fill = _fill(CAMP_BLUE)
-    rider_cell.alignment = _align("center")
-
-    stop_cell = ws.cell(row=total_row, column=5, value=f"=SUM(E4:E{total_row - 1})")
-    stop_cell.font = _font(bold=True, color=WHITE)
-    stop_cell.fill = _fill(CAMP_BLUE)
-    stop_cell.alignment = _align("center")
-
-    for ci in [6, 7, 8]:
-        cell = ws.cell(row=total_row, column=ci, value="—")
+    # Totals row
+    tr = 4 + len(vehicles)
+    ws.merge_cells(f"A{tr}:B{tr}")
+    c = ws[f"A{tr}"]
+    c.value = (f"TOTAL  ({total_riders} riders / {total_cap} capacity "
+               f"/ {len(vehicles)} vehicles)")
+    c.font = _font(bold=True, size=10, color=WHITE)
+    c.fill = _fill(CAMP_BLUE)
+    c.alignment = _align("center")
+    for ci, val in [(3, total_cap), (4, f"=SUM(D4:D{tr-1})"),
+                    (5, f"=SUM(E4:E{tr-1})"), (6,"—"),(7,"—"),(8,"—")]:
+        cell = ws.cell(row=tr, column=ci, value=val)
         cell.font = _font(bold=True, color=WHITE)
         cell.fill = _fill(CAMP_BLUE)
         cell.alignment = _align("center")
-
-    ws.row_dimensions[total_row].height = 18
+    ws.row_dimensions[tr].height = 18
 
     # Legend
-    legend_row = total_row + 2
-    ws.merge_cells(f"A{legend_row}:H{legend_row}")
-    leg_cell = ws[f"A{legend_row}"]
-    leg_cell.value = (
-        "LEGEND:   🔵 Blue time = Confirmed via Google Maps live traffic   |   "
-        "🟡 Yellow time * = Estimated based on road network knowledge of Bucks/Montgomery County"
-    )
-    leg_cell.font = _font(size=9, italic=True, color="555555")
-    leg_cell.alignment = _align("left")
-    ws.row_dimensions[legend_row].height = 16
+    lr = tr + 2
+    ws.merge_cells(f"A{lr}:H{lr}")
+    c = ws[f"A{lr}"]
+    c.value = ("LEGEND:   🟡 Yellow * = Estimated time  |  "
+               "Clustering uses real geocoded street addresses (OpenStreetMap) — ZIP codes ignored  |  "
+               "🔵 Blue = Google Maps verified")
+    c.font      = _font(size=9, italic=True, color="555555")
+    c.alignment = _align("left")
+    ws.row_dimensions[lr].height = 16
 
 
 def build_vehicle_sheet(wb: Workbook, veh: Vehicle):
     ws = wb.create_sheet(title=veh.name)
+    for col, w in zip("ABCDE", [9, 40, 28, 12, 22]):
+        ws.column_dimensions[col].width = w
 
-    ws.column_dimensions["A"].width = 9
-    ws.column_dimensions["B"].width = 38
-    ws.column_dimensions["C"].width = 28
-    ws.column_dimensions["D"].width = 12
-    ws.column_dimensions["E"].width = 22
-
-    # Row 1: Title
+    # Row 1
     ws.merge_cells("A1:E1")
     c = ws["A1"]
-    c.value = f"🚌  {veh.name}  —  Route Sheet"
-    c.font = _font(bold=True, size=14, color=WHITE)
-    c.fill = _fill(CAMP_BLUE)
+    c.value     = f"🚌  {veh.name}  —  Route Sheet"
+    c.font      = _font(bold=True, size=14, color=WHITE)
+    c.fill      = _fill(CAMP_BLUE)
     c.alignment = _align("center")
     ws.row_dimensions[1].height = 28
 
-    # Row 2: Summary
+    # Row 2: summary
     ws.merge_cells("A2:E2")
     confirmed = veh.time_source == "Google Maps"
-    src_tag = "✓ Google Maps" if confirmed else "* Estimated"
-    summary = (
-        f"Start: {veh.start_address}   |   "
-        f"Cap: {veh.capacity}   |   "
-        f"Riders: {veh.rider_count} ({veh.utilization_pct}%)   |   "
-        f"Total Route: {veh.total_time}, {veh.total_distance}   [{src_tag}]"
-    )
     c = ws["A2"]
-    c.value = summary
-    c.font = _font(size=9, italic=True)
-    c.fill = _fill(GREEN_FILL if confirmed else YELLOW_FILL)
+    c.value = (f"Start: {veh.start_address}   |   Cap: {veh.capacity}   |   "
+               f"Riders: {veh.rider_count} ({veh.utilization_pct}%)   |   "
+               f"Total Route: {veh.total_time}, {veh.total_distance}   "
+               f"[{'✓ Google Maps' if confirmed else '* Estimated'}]")
+    c.font      = _font(size=9, italic=True)
+    c.fill      = _fill(GREEN_FILL if confirmed else YELLOW_FILL)
     c.alignment = _align("left")
     ws.row_dimensions[2].height = 16
 
-    # Row 3: Column headers
-    headers = ["Stop #", "Address", "Riders", "# Riders", "Drive Time"]
-    for ci, h in enumerate(headers, 1):
+    # Row 3: column headers
+    for ci, h in enumerate(["Stop #","Address","Riders","# Riders","Drive Time"], 1):
         cell = ws.cell(row=3, column=ci, value=h)
-        cell.font = _font(bold=True, size=10, color=WHITE)
-        cell.fill = _fill(CAMP_BLUE)
+        cell.font      = _font(bold=True, size=10, color=WHITE)
+        cell.fill      = _fill(CAMP_BLUE)
         cell.alignment = _align("center")
-        cell.border = _border(bottom=MEDIUM_BORDER)
+        cell.border    = _border(bottom=MED_SIDE)
     ws.row_dimensions[3].height = 16
 
-    # Row 4: START row
-    ws.cell(row=4, column=1, value=" START").font = _font(bold=True, color="444444")
-    ws.cell(row=4, column=2, value=veh.start_address).font = _font(italic=True, color="444444")
-    ws.cell(row=4, column=3, value="Departure point").font = _font(italic=True, color="888888")
-    for ci in range(1, 6):
-        ws.cell(row=4, column=ci).fill = _fill(LIGHT_GRAY)
-        ws.cell(row=4, column=ci).alignment = _align("center" if ci != 2 else "left")
+    # Row 4: START
+    for ci, val in enumerate([" START", veh.start_address, "Departure point", None, None], 1):
+        cell = ws.cell(row=4, column=ci, value=val)
+        cell.font      = _font(bold=(ci==1), italic=(ci==3), color="444444")
+        cell.fill      = _fill(LIGHT_GRAY)
+        cell.alignment = _align("left" if ci == 2 else "center")
     ws.row_dimensions[4].height = 14
 
     # Stop rows
-    data_start_row = 5
+    ds = 5
     for si, stop in enumerate(veh.stops):
-        row = data_start_row + si
-        fill = _fill(WHITE) if si % 2 == 0 else _fill(LIGHT_GRAY)
-
-        ws.cell(row=row, column=1, value=si + 1).font = _font(bold=True)
-        ws.cell(row=row, column=2, value=stop.address).font = _font(size=10)
-        ws.cell(row=row, column=3, value=stop.rider_names).font = _font(size=10)
-        ws.cell(row=row, column=4, value=stop.rider_count).font = _font(size=10)
-        ws.cell(row=row, column=5, value=stop.drive_time).font = _font(size=10)
-
-        for ci in range(1, 6):
-            ws.cell(row=row, column=ci).fill = fill
-            ws.cell(row=row, column=ci).alignment = _align(
-                "center" if ci in (1, 4) else "left"
-            )
-            ws.cell(row=row, column=ci).border = _border(
-                bottom=Side(style="thin", color="CCCCCC")
-            )
+        row = ds + si
+        bg  = _fill(WHITE) if si % 2 == 0 else _fill(LIGHT_GRAY)
+        for ci, val in enumerate([si+1, stop.address, stop.rider_names,
+                                   stop.rider_count, stop.drive_time], 1):
+            cell = ws.cell(row=row, column=ci, value=val)
+            cell.font      = _font(bold=(ci==1), size=10)
+            cell.fill      = bg
+            cell.alignment = _align("center" if ci in (1,4) else "left")
+            cell.border    = _border(bottom=Side(style="thin", color="CCCCCC"))
         ws.row_dimensions[row].height = 14
 
     # ARRIVE row
-    arrive_row = data_start_row + len(veh.stops)
-
-    # Calculate final leg time
+    arrive = ds + len(veh.stops)
     if veh.stops:
-        last_zip = _stop_zip(veh.stops[-1])
-        d = approx_dist_mi(last_zip, "18976") if last_zip else 5.0
-        final_mins = max(3, round(d * 2.8))
-        arrive_time = f"{final_mins} min → ARRIVE"
+        last = veh.stops[-1]
+        final = max(3, round(haversine_mi(last.lat, last.lon, *CAMP_COORDS) * 3.0))
+        arrive_time = f"{final} min → ARRIVE"
     else:
         arrive_time = "— → ARRIVE"
 
-    ws.cell(row=arrive_row, column=1, value="ARRIVE").font = _font(bold=True, color="006400")
-    ws.cell(row=arrive_row, column=2, value="828 Elbow Lane, Warrington, PA").font = _font(bold=True, color="006400")
-    ws.cell(row=arrive_row, column=3, value="—").font = _font(color="006400")
-    ws.cell(row=arrive_row, column=4, value="—").font = _font(color="006400")
-    ws.cell(row=arrive_row, column=5, value=arrive_time).font = _font(bold=True, color="006400")
-    for ci in range(1, 6):
-        ws.cell(row=arrive_row, column=ci).fill = _fill(GREEN_FILL)
-        ws.cell(row=arrive_row, column=ci).alignment = _align(
-            "center" if ci in (1, 3, 4) else "left"
-        )
-        ws.cell(row=arrive_row, column=ci).border = _border(
-            top=MEDIUM_BORDER, bottom=MEDIUM_BORDER
-        )
-    ws.row_dimensions[arrive_row].height = 16
+    for ci, val in enumerate(["ARRIVE","828 Elbow Lane, Warrington, PA",
+                               "—","—", arrive_time], 1):
+        cell = ws.cell(row=arrive, column=ci, value=val)
+        cell.font      = _font(bold=True, color="006400")
+        cell.fill      = _fill(GREEN_FILL)
+        cell.alignment = _align("left" if ci == 2 else "center")
+        cell.border    = _border(top=MED_SIDE, bottom=MED_SIDE)
+    ws.row_dimensions[arrive].height = 16
 
-    # Total riders formula
-    total_row = arrive_row + 1
-    ws.cell(row=total_row, column=4, value="Total Riders:").font = _font(bold=True)
-    ws.cell(row=total_row, column=4).alignment = _align("right")
-    formula_cell = ws.cell(
-        row=total_row, column=5,
-        value=f"=SUM(D{data_start_row}:D{arrive_row - 1})"
-    )
-    formula_cell.font = _font(bold=True)
-    formula_cell.alignment = _align("center")
+    # Totals
+    tr = arrive + 1
+    ws.cell(row=tr, column=4, value="Total Riders:").font = _font(bold=True)
+    ws.cell(row=tr, column=4).alignment = _align("right")
+    cell = ws.cell(row=tr, column=5, value=f"=SUM(D{ds}:D{arrive-1})")
+    cell.font = _font(bold=True)
+    cell.alignment = _align("center")
 
-    # Source note
-    note_row = total_row + 1
-    ws.merge_cells(f"A{note_row}:E{note_row}")
-    note = ws[f"A{note_row}"]
+    # Note
+    nr = tr + 1
+    ws.merge_cells(f"A{nr}:E{nr}")
+    note = ws[f"A{nr}"]
     if confirmed:
         note.value = "✓ Drive time confirmed via Google Maps"
-        note.font = _font(size=9, color="006400", italic=True)
+        note.font  = _font(size=9, color="006400", italic=True)
     else:
-        note.value = "* Drive time is an estimate"
-        note.font = _font(size=9, color="996600", italic=True)
+        note.value = ("* Drive time estimated (straight-line × 3 min/mi)  |  "
+                      "Stop order based on real geocoded coordinates — ZIP codes not used")
+        note.font  = _font(size=9, color="996600", italic=True)
     note.alignment = _align("left")
 
 
 # ---------------------------------------------------------------------------
-# Main entry point
+# Public API
 # ---------------------------------------------------------------------------
 
 def generate_routes(
@@ -834,19 +751,13 @@ def generate_routes(
     vehicles_text: str,
     output_path: str = "bus_routes_output.xlsx",
     route_data: Optional[list] = None,
+    progress_cb=None,
 ) -> str:
     """
-    Generate bus routes Excel file.
+    Full pipeline: CSV + fleet config → geocode → cluster by real proximity → Excel.
 
-    Args:
-        csv_text:       Raw CSV text (or file path)
-        vehicles_text:  Multi-line fleet config text
-        output_path:    Where to save the .xlsx
-        route_data:     Optional pre-computed route data from Claude AI analysis
-                        (list of dicts with keys: vehicle_name, stops, total_time, etc.)
-
-    Returns:
-        output_path on success
+    Geocoding results are cached in geocache.json so re-runs are fast.
+    First run with new addresses takes ~1 second per unique address.
     """
     students = parse_students_csv(csv_text)
     if not students:
@@ -856,12 +767,15 @@ def generate_routes(
     if not vehicle_configs:
         raise ValueError("No vehicles parsed. Check fleet configuration format.")
 
+    if progress_cb:
+        progress_cb(f"Loaded {len(students)} students across "
+                    f"{len({s.full_address for s in students})} unique addresses, "
+                    f"{len(vehicle_configs)} vehicles")
+
     if route_data:
-        # Use Claude AI-provided route data
         vehicles = _apply_ai_route_data(students, vehicle_configs, route_data)
     else:
-        # Fall back to algorithmic clustering
-        vehicles = cluster_students(students, vehicle_configs)
+        vehicles = cluster_and_route(students, vehicle_configs, progress_cb)
 
     wb = Workbook()
     build_dashboard(wb, vehicles)
@@ -869,39 +783,12 @@ def generate_routes(
         build_vehicle_sheet(wb, veh)
 
     wb.save(output_path)
+    if progress_cb:
+        progress_cb(f"✅ Saved: {output_path}")
     return output_path
 
 
-def _apply_ai_route_data(
-    students: list[Student],
-    vehicle_configs: list[dict],
-    route_data: list[dict]
-) -> list[Vehicle]:
-    """
-    Build Vehicle objects from Claude AI route analysis results.
-
-    route_data format (list of dicts):
-    [
-      {
-        "vehicle_name": "Vehicle A",
-        "start_address": "...",
-        "capacity": 5,
-        "total_time": "1 hr 14 min",
-        "total_distance": "26.1 mi",
-        "time_source": "Google Maps",  # or "Estimated"
-        "stops": [
-          {
-            "address": "562 Coach Rd, Horsham, PA",
-            "rider_names": ["Boyd"],
-            "rider_count": 1,
-            "drive_time": "6 min from start"
-          },
-          ...
-        ]
-      },
-      ...
-    ]
-    """
+def _apply_ai_route_data(students, vehicle_configs, route_data) -> list:
     vehicles = []
     for rd in route_data:
         veh = Vehicle(
@@ -912,13 +799,11 @@ def _apply_ai_route_data(
             total_distance=rd.get("total_distance", "—"),
             time_source=rd.get("time_source", "Estimated"),
         )
-        for stop_data in rd.get("stops", []):
-            stop = Stop(address=stop_data.get("address", ""))
-            # Create placeholder Student objects for display
-            for name in stop_data.get("rider_names", []):
-                s = Student(0, name, "", "", "", "")
-                stop.riders.append(s)
-            stop.drive_time = stop_data.get("drive_time", "")
+        for sd in rd.get("stops", []):
+            stop = Stop(address=sd.get("address", ""))
+            for name in sd.get("rider_names", []):
+                stop.riders.append(Student(0, name, "", "", "", ""))
+            stop.drive_time = sd.get("drive_time", "")
             veh.stops.append(stop)
         vehicles.append(veh)
     return vehicles
@@ -929,20 +814,15 @@ def _apply_ai_route_data(
 # ---------------------------------------------------------------------------
 
 def main():
-    parser = argparse.ArgumentParser(description="Bus Route Optimizer")
-    parser.add_argument("--csv", required=True, help="Path to student CSV file")
-    parser.add_argument("--vehicles", required=True,
-                        help="Fleet config text (newline-separated, or pass a file path)")
-    parser.add_argument("--output", default="bus_routes_output.xlsx",
-                        help="Output Excel file path")
-    parser.add_argument("--route-json", default=None,
-                        help="Optional JSON file with pre-computed AI route data")
+    parser = argparse.ArgumentParser(description="Bus Route Optimizer — Elbow Lane Day Camp")
+    parser.add_argument("--csv",        required=True)
+    parser.add_argument("--vehicles",   required=True)
+    parser.add_argument("--output",     default="bus_routes_output.xlsx")
+    parser.add_argument("--route-json", default=None)
     args = parser.parse_args()
 
     with open(args.csv, encoding="utf-8-sig") as f:
         csv_text = f.read()
-
-    # vehicles arg can be a text block or a file
     try:
         with open(args.vehicles) as f:
             vehicles_text = f.read()
@@ -954,8 +834,7 @@ def main():
         with open(args.route_json) as f:
             route_data = json.load(f)
 
-    out = generate_routes(csv_text, vehicles_text, args.output, route_data)
-    print(f"✅  Routes saved to: {out}")
+    generate_routes(csv_text, vehicles_text, args.output, route_data, print)
 
 
 if __name__ == "__main__":
