@@ -41,6 +41,7 @@ CAMP_ADDRESS  = "828 Elbow Lane, Warrington, PA 18976"
 CAMP_COORDS   = (40.2454, -75.1407)    # fallback if geocode fails
 GEOCACHE_FILE = "geocache.json"         # persists between runs to avoid re-geocoding
 NEIGHBOR_MI   = 1.5                     # addresses within 1.5 mi = candidate same-van
+MIN_UTIL      = 0.75                    # vehicles below 75% capacity get consolidated
 
 # ---------------------------------------------------------------------------
 # Data structures
@@ -99,7 +100,6 @@ class Vehicle:
     stops: list = field(default_factory=list)
     total_time: str = ""
     total_distance: str = ""
-    time_source: str = "Estimated"
     start_lat: float = 0.0
     start_lon: float = 0.0
 
@@ -427,58 +427,210 @@ def cluster_and_route(students: list, vehicles: list, progress_cb=None) -> list:
             start_lat=lat, start_lon=lon,
         ))
 
-    # ── 5. Assign family units to vehicles ────────────────────────────────
-    # Sort farthest-from-camp first so distant students get priority placement
-    all_units = sorted(family_units, key=dist_to_camp, reverse=True)
+    # ── 5. Assign WHOLE CLUSTERS to vehicles ──────────────────────────────
+    #
+    # KEY RULE: geographic neighbors (clustered in Step 3) are ALWAYS kept
+    # on the same vehicle. We assign entire clusters at once, not individual
+    # family units. This guarantees that e.g. 5 Lansdale addresses within
+    # 0.3 mi of each other will never be split across different vans.
+    #
+    # Algorithm:
+    #   a) Split any cluster too large for a single vehicle into sub-clusters
+    #      (sorted by distance from camp to preserve route order)
+    #   b) Sort clusters farthest-from-camp first (priority placement)
+    #   c) For each cluster, score every vehicle: base = distance from cluster
+    #      centroid to vehicle start. Assign to best-fitting vehicle.
+    #   d) If a cluster fits nowhere whole, split it and retry each piece.
+
+    def cluster_size(cl):
+        return sum(len(u) for u in cl)
+
+    def cluster_centroid(cl):
+        lats = [unit_coords(u)[0] for u in cl]
+        lons = [unit_coords(u)[1] for u in cl]
+        return sum(lats)/len(lats), sum(lons)/len(lons)
+
+    def cluster_dist_to_camp(cl):
+        lat, lon = cluster_centroid(cl)
+        return haversine_mi(lat, lon, camp_lat, camp_lon)
+
+    # Split oversized clusters into vehicle-sized pieces while keeping
+    # the closest addresses together within each piece
+    max_cap = max(v["capacity"] for v in vehicles)
+    assignable_clusters = []
+    for cl in clusters:
+        if cluster_size(cl) <= max_cap:
+            assignable_clusters.append(cl)
+        else:
+            # Sort units within cluster by distance to camp, split into chunks
+            sorted_units = sorted(cl, key=dist_to_camp, reverse=True)
+            chunk, chunk_count = [], 0
+            for unit in sorted_units:
+                if chunk_count + len(unit) > max_cap and chunk:
+                    assignable_clusters.append(chunk)
+                    chunk, chunk_count = [], 0
+                chunk.append(unit)
+                chunk_count += len(unit)
+            if chunk:
+                assignable_clusters.append(chunk)
+
+    # Sort clusters: farthest from camp first
+    assignable_clusters.sort(key=cluster_dist_to_camp, reverse=True)
 
     assignments: list = [[] for _ in veh_objects]
-    counts      = [0]  * len(veh_objects)
+    counts = [0] * len(veh_objects)
 
-    def score(unit, vi) -> float:
-        """Score vehicle vi for this unit. Lower = better. inf = full."""
+    def score_cluster(cl, vi) -> float:
+        """Score vehicle vi for this whole cluster. Lower = better. inf = no fit."""
         remaining = veh_objects[vi].capacity - counts[vi]
-        if remaining < len(unit):
-            return float("inf")   # HARD CAP — never exceed capacity
-        ulat, ulon = unit_coords(unit)
-        # Base score: distance from this address to vehicle's start
-        geo = haversine_mi(ulat, ulon, veh_objects[vi].start_lat, veh_objects[vi].start_lon)
-        # Clustering bonus: reward keeping nearby students on the same van
-        if assignments[vi]:
-            nearest = min(
-                haversine_mi(ulat, ulon, *unit_coords(eu))
-                for eu in assignments[vi]
-            )
-            geo -= min(2.0, max(0.0, 2.0 - nearest))
-        return geo
+        if remaining < cluster_size(cl):
+            return float("inf")  # HARD CAP
+        clat, clon = cluster_centroid(cl)
+        # Primary: geographic distance from cluster center to vehicle start
+        return haversine_mi(clat, clon, veh_objects[vi].start_lat, veh_objects[vi].start_lon)
 
-    unplaced = []
-    for unit in all_units:
-        best = min(range(len(veh_objects)), key=lambda vi: score(unit, vi))
-        if score(unit, best) < float("inf"):
-            assignments[best].append(unit)
-            counts[best] += len(unit)
+    leftover_units = []  # individual units that couldn't be placed as part of a cluster
+
+    for cl in assignable_clusters:
+        scores = [(score_cluster(cl, vi), vi) for vi in range(len(veh_objects))]
+        best_score, best_vi = min(scores)
+
+        if best_score < float("inf"):
+            # Assign the WHOLE cluster to this vehicle — neighbors stay together
+            for unit in cl:
+                assignments[best_vi].append(unit)
+            counts[best_vi] += cluster_size(cl)
         else:
-            unplaced.append(unit)
+            # No vehicle can fit the whole cluster — assign units individually
+            for unit in cl:
+                leftover_units.append(unit)
 
-    # Second pass: place stragglers in vehicle with most remaining space
-    for unit in unplaced:
+    # Place any leftover individual units (shouldn't happen often)
+    for unit in sorted(leftover_units, key=dist_to_camp, reverse=True):
         size = len(unit)
-        candidates = [
-            (veh_objects[vi].capacity - counts[vi], vi)
-            for vi in range(len(veh_objects))
-            if veh_objects[vi].capacity - counts[vi] >= size
+        scores = []
+        for vi in range(len(veh_objects)):
+            remaining = veh_objects[vi].capacity - counts[vi]
+            if remaining >= size:
+                ulat, ulon = unit_coords(unit)
+                d = haversine_mi(ulat, ulon, veh_objects[vi].start_lat, veh_objects[vi].start_lon)
+                scores.append((d, vi))
+        if scores:
+            _, best_vi = min(scores)
+        else:
+            best_vi = min(range(len(veh_objects)), key=lambda i: counts[i])
+        assignments[best_vi].append(unit)
+        counts[best_vi] += size
+
+    # ── 5b. Consolidation: merge under-filled vehicles (< 75% capacity) ──────
+    #
+    # Strategy:
+    #   1. Find the most under-filled active vehicle (the "donor")
+    #   2. Try a FULL merge first: if any vehicle has room for ALL its students,
+    #      move everyone there (keeps geographic clusters intact)
+    #   3. If no full merge is possible, try PARTIAL moves: move individual
+    #      family units one at a time to the nearest vehicle that has room,
+    #      until the donor reaches 75% or is emptied
+    #   4. Repeat until all active vehicles are at ≥75% or no moves possible
+    changed = True
+    max_passes = 20  # safety limit
+    passes = 0
+    while changed and passes < max_passes:
+        changed = False
+        passes += 1
+        under = [
+            vi for vi in range(len(veh_objects))
+            if counts[vi] > 0 and counts[vi] / veh_objects[vi].capacity < MIN_UTIL
         ]
-        vi = max(candidates)[1] if candidates else min(
-            range(len(veh_objects)), key=lambda i: counts[i]
-        )
-        assignments[vi].append(unit)
-        counts[vi] += size
+        if not under:
+            break
+
+        vi_src = min(under, key=lambda vi: counts[vi] / veh_objects[vi].capacity)
+        units_to_move = assignments[vi_src][:]
+        total_to_move = counts[vi_src]
+
+        # Centroid of the donor vehicle's students
+        src_lat = sum(u[0].lat for u in units_to_move) / len(units_to_move)
+        src_lon = sum(u[0].lon for u in units_to_move) / len(units_to_move)
+
+        # ── Try full merge first ──────────────────────────────────────────
+        full_dest = None
+        full_dist = float("inf")
+        for vi_dst in range(len(veh_objects)):
+            if vi_dst == vi_src:
+                continue
+            if veh_objects[vi_dst].capacity - counts[vi_dst] < total_to_move:
+                continue
+            # Score by distance from donor centroid to destination's student centroid
+            if assignments[vi_dst]:
+                dlat = sum(u[0].lat for u in assignments[vi_dst]) / len(assignments[vi_dst])
+                dlon = sum(u[0].lon for u in assignments[vi_dst]) / len(assignments[vi_dst])
+            else:
+                dlat, dlon = veh_objects[vi_dst].start_lat, veh_objects[vi_dst].start_lon
+            d = haversine_mi(src_lat, src_lon, dlat, dlon)
+            if d < full_dist:
+                full_dist = d
+                full_dest = vi_dst
+
+        if full_dest is not None:
+            for unit in units_to_move:
+                assignments[full_dest].append(unit)
+            counts[full_dest] += total_to_move
+            assignments[vi_src] = []
+            counts[vi_src] = 0
+            if progress_cb:
+                progress_cb(f"  Merged {veh_objects[vi_src].name} ({total_to_move} riders) "
+                            f"→ {veh_objects[full_dest].name} "
+                            f"(now {counts[full_dest]}/{veh_objects[full_dest].capacity})")
+            changed = True
+            continue
+
+        # ── Partial move: redistribute individual units to nearest vehicle ─
+        # Sort units by distance to best available destination
+        moved_any = False
+        remaining_units = list(units_to_move)
+        for unit in sorted(remaining_units, key=dist_to_camp, reverse=True):
+            ulat, ulon = unit_coords(unit)
+            unit_size = len(unit)
+            best_vi = None
+            best_d = float("inf")
+            for vi_dst in range(len(veh_objects)):
+                if vi_dst == vi_src:
+                    continue
+                if veh_objects[vi_dst].capacity - counts[vi_dst] < unit_size:
+                    continue
+                if assignments[vi_dst]:
+                    dlat = sum(u[0].lat for u in assignments[vi_dst]) / len(assignments[vi_dst])
+                    dlon = sum(u[0].lon for u in assignments[vi_dst]) / len(assignments[vi_dst])
+                else:
+                    dlat, dlon = veh_objects[vi_dst].start_lat, veh_objects[vi_dst].start_lon
+                d = haversine_mi(ulat, ulon, dlat, dlon)
+                if d < best_d:
+                    best_d = d
+                    best_vi = vi_dst
+
+            if best_vi is not None:
+                assignments[best_vi].append(unit)
+                counts[best_vi] += unit_size
+                assignments[vi_src].remove(unit)
+                counts[vi_src] -= unit_size
+                moved_any = True
+                if progress_cb:
+                    progress_cb(f"  Moved {unit[0].last} family ({unit_size}) "
+                                f"{veh_objects[vi_src].name} → {veh_objects[best_vi].name}")
+                # Stop partial moves once donor hits 75%
+                if counts[vi_src] == 0 or (counts[vi_src] / veh_objects[vi_src].capacity >= MIN_UTIL):
+                    break
+
+        if moved_any:
+            changed = True
 
     # ── 6. Sequence stops: furthest from camp first (no backtracking) ─────
     for vi, veh in enumerate(veh_objects):
         if not assignments[vi]:
             veh.total_time = "—"
             veh.total_distance = "—"
+            veh.stops = []
             continue
 
         # Build address-level stops
@@ -530,7 +682,7 @@ def cluster_and_route(students: list, vehicles: list, progress_cb=None) -> list:
             plat, plon = stop.lat, stop.lon
         dist += haversine_mi(plat, plon, camp_lat, camp_lon)
         veh.total_distance = f"{round(dist, 1)} mi"
-        veh.time_source    = "Estimated"
+
 
     return veh_objects
 
@@ -539,8 +691,8 @@ def cluster_and_route(students: list, vehicles: list, progress_cb=None) -> list:
 # Excel generation
 # ---------------------------------------------------------------------------
 
-CAMP_BLUE   = "1F497D"
-LIGHT_BLUE  = "DDEEFF"
+CAMP_BLUE   = "6D1F2F"
+LIGHT_BLUE  = "F5E6E9"
 LIGHT_GRAY  = "F2F2F2"
 GREEN_FILL  = "E2EFDA"
 YELLOW_FILL = "FFEB9C"
@@ -600,11 +752,11 @@ def build_dashboard(wb: Workbook, vehicles: list):
     for ri, veh in enumerate(vehicles):
         row = 4 + ri
         bg   = _fill(WHITE) if ri % 2 == 0 else _fill(LIGHT_GRAY)
-        tfill = _fill(GREEN_FILL if veh.time_source == "Google Maps" else YELLOW_FILL)
+        tfill = _fill(YELLOW_FILL)
         vals = [veh.name,
                 f"{veh.start_address}  |  {veh.corridor}",
                 veh.capacity, veh.rider_count, veh.stop_count,
-                veh.total_time, veh.total_distance, veh.time_source]
+                veh.total_time, veh.total_distance, "Estimated"]
         for ci, val in enumerate(vals, 1):
             cell = ws.cell(row=row, column=ci, value=val)
             cell.font      = _font(size=10)
@@ -638,7 +790,7 @@ def build_dashboard(wb: Workbook, vehicles: list):
     c = ws[f"A{lr}"]
     c.value = ("LEGEND:   🟡 Yellow * = Estimated time  |  "
                "Clustering uses real geocoded street addresses (OpenStreetMap) — ZIP codes ignored  |  "
-               "🔵 Blue = Google Maps verified")
+               "Times are straight-line distance estimates (address coords via OpenStreetMap)")
     c.font      = _font(size=9, italic=True, color="555555")
     c.alignment = _align("left")
     ws.row_dimensions[lr].height = 16
@@ -660,14 +812,12 @@ def build_vehicle_sheet(wb: Workbook, veh: Vehicle):
 
     # Row 2: summary
     ws.merge_cells("A2:E2")
-    confirmed = veh.time_source == "Google Maps"
     c = ws["A2"]
     c.value = (f"Start: {veh.start_address}   |   Cap: {veh.capacity}   |   "
                f"Riders: {veh.rider_count} ({veh.utilization_pct}%)   |   "
-               f"Total Route: {veh.total_time}, {veh.total_distance}   "
-               f"[{'✓ Google Maps' if confirmed else '* Estimated'}]")
+               f"Total Route: {veh.total_time}, {veh.total_distance}   [* Estimated]")
     c.font      = _font(size=9, italic=True)
-    c.fill      = _fill(GREEN_FILL if confirmed else YELLOW_FILL)
+    c.fill      = _fill(YELLOW_FILL)
     c.alignment = _align("left")
     ws.row_dimensions[2].height = 16
 
@@ -732,13 +882,9 @@ def build_vehicle_sheet(wb: Workbook, veh: Vehicle):
     nr = tr + 1
     ws.merge_cells(f"A{nr}:E{nr}")
     note = ws[f"A{nr}"]
-    if confirmed:
-        note.value = "✓ Drive time confirmed via Google Maps"
-        note.font  = _font(size=9, color="006400", italic=True)
-    else:
-        note.value = ("* Drive time estimated (straight-line × 3 min/mi)  |  "
-                      "Stop order based on real geocoded coordinates — ZIP codes not used")
-        note.font  = _font(size=9, color="996600", italic=True)
+    note.value = ("* Drive time estimated (straight-line × 3 min/mi)  |  "
+                  "Stop order based on real geocoded street addresses (OpenStreetMap)")
+    note.font  = _font(size=9, color="996600", italic=True)
     note.alignment = _align("left")
 
 
@@ -797,7 +943,7 @@ def _apply_ai_route_data(students, vehicle_configs, route_data) -> list:
             capacity=rd.get("capacity", 13),
             total_time=rd.get("total_time", "—"),
             total_distance=rd.get("total_distance", "—"),
-            time_source=rd.get("time_source", "Estimated"),
+
         )
         for sd in rd.get("stops", []):
             stop = Stop(address=sd.get("address", ""))
