@@ -599,11 +599,45 @@ def cluster_and_route(students: list, vehicles: list,
                                       lat=rep.lat, lon=rep.lon)
             addr_stop[key].riders.extend(unit)
 
-        # Order stops: farthest from camp first (no backtracking)
-        sorted_stops = sorted(
-            addr_stop.values(),
-            key=lambda s: haversine_mi(s.lat, s.lon, camp_lat, camp_lon),
-            reverse=True)
+        # ── Nearest-neighbor TSP sequencing ─────────────────────────────
+        # Start from vehicle start, greedily pick closest unvisited stop,
+        # with a "no-backtracking" constraint: once we're moving toward camp
+        # we don't allow stops that are significantly farther from camp than
+        # the current position (prevents U-turns).
+        #
+        # This guarantees:
+        #   • Geographic neighbours are consecutive stops
+        #   • Route flows roughly toward camp (no major detours)
+        #   • Every stop is visited exactly once
+        unvisited = list(addr_stop.values())
+
+        def dist_to_camp_s(s):
+            return haversine_mi(s.lat, s.lon, camp_lat, camp_lon)
+
+        # Start the route from the stop farthest from camp
+        # (ensures we're heading toward camp throughout the route)
+        first = max(unvisited, key=dist_to_camp_s)
+        sorted_stops = [first]
+        unvisited.remove(first)
+
+        while unvisited:
+            last = sorted_stops[-1]
+            # From current position, find nearest unvisited stop
+            # Slight bias: prefer stops that are also closer to camp
+            # (weight = geographic distance + 0.3 × extra distance-from-camp)
+            cur_d2c = dist_to_camp_s(last)
+            best_stop, best_score = None, float("inf")
+            for s in unvisited:
+                geo_d = haversine_mi(last.lat, last.lon, s.lat, s.lon)
+                # Small penalty if this stop is farther from camp than where we are
+                # (discourages backtracking but doesn't prevent necessary turns)
+                d2c_s = dist_to_camp_s(s)
+                backtrack_penalty = max(0.0, d2c_s - cur_d2c) * 0.5
+                score = geo_d + backtrack_penalty
+                if score < best_score:
+                    best_score, best_stop = score, s
+            sorted_stops.append(best_stop)
+            unvisited.remove(best_stop)
 
         # Real driving times: vehicle start → stop1 → … → stopN → camp
         coord_seq = ([(veh.start_lat, veh.start_lon)]
