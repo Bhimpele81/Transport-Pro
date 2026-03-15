@@ -380,82 +380,81 @@ def cluster_students(students: list[Student], vehicles: list[dict]) -> list[Vehi
         if not assigned:
             clusters.append([unit])
 
-    # --- Step 2.5: Split oversized clusters so each fits in at least one vehicle ---
-    max_vehicle_capacity = max(v["capacity"] for v in vehicles)
-    split_clusters: list[list[list[Student]]] = []
-    for cluster in clusters:
-        if sum(len(u) for u in cluster) <= max_vehicle_capacity:
-            split_clusters.append(cluster)
-        else:
-            current: list[list[Student]] = []
-            current_count = 0
-            for unit in sorted(cluster, key=lambda u: unit_zip(u)):
-                unit_size = len(unit)
-                if current_count + unit_size > max_vehicle_capacity and current:
-                    split_clusters.append(current)
-                    current = []
-                    current_count = 0
-                current.append(unit)
-                current_count += unit_size
-            if current:
-                split_clusters.append(current)
-    clusters = split_clusters
-
     # --- Step 3: Build Vehicle objects ---
     veh_objects: list[Vehicle] = [
         Vehicle(name=v["name"], start_address=v["start"], capacity=v["capacity"])
         for v in vehicles
     ]
 
-    # Sort clusters by distance to destination (farthest first)
-    def cluster_avg_dist_to_dest(cluster: list[list[Student]]) -> float:
-        zips = [unit_zip(u) for u in cluster]
-        dists = [dist_to_dest(z) for z in zips if z]
-        return sum(dists) / len(dists) if dists else 0.0
+    # --- Step 2.5: Flatten clusters to individual family units for fine-grained assignment ---
+    # We do NOT pre-aggregate into clusters; instead assign each family unit individually
+    # so we can strictly respect each vehicle's specific capacity.
+    # Sort family units: farthest from camp first (so distant riders get placed first)
+    all_units: list[list[Student]] = sorted(
+        family_units,
+        key=lambda u: dist_to_dest(unit_zip(u)),
+        reverse=True,
+    )
 
-    sorted_clusters = sorted(clusters, key=cluster_avg_dist_to_dest, reverse=True)
-
-    # --- Step 4: Assign clusters to vehicles (proximity + capacity) ---
-    vehicle_assignments: list[list] = [[] for _ in veh_objects]
+    # --- Step 4: Assign family units to vehicles with STRICT capacity enforcement ---
+    vehicle_assignments: list[list[list[Student]]] = [[] for _ in veh_objects]
     vehicle_counts = [0] * len(veh_objects)
 
-    # First pass: try to respect capacity hard limits
-    unassigned: list = []
-    for cluster in sorted_clusters:
-        cluster_zip = unit_zip(cluster[0])
-        cluster_size = sum(len(u) for u in cluster)
-
+    def best_vehicle_for_unit(unit: list[Student], counts: list[int]) -> int:
+        """Return index of best vehicle for this unit (closest start, strict cap)."""
+        uz = unit_zip(unit)
+        unit_size = len(unit)
         best_vi = None
         best_score = float("inf")
         for vi, veh in enumerate(veh_objects):
-            remaining = veh.capacity - vehicle_counts[vi]
-            if remaining < cluster_size:
-                continue  # skip — not enough room
+            remaining = veh.capacity - counts[vi]
+            if remaining < unit_size:
+                continue  # HARD CAP: no room
             vz = _vehicle_start_zip(veh)
-            geo_dist = approx_dist_mi(cluster_zip, vz) if vz and cluster_zip else 10.0
-            if geo_dist < best_score:
-                best_score = geo_dist
+            geo = approx_dist_mi(uz, vz) if (uz and vz) else 10.0
+            # Small bonus for vehicles that already have nearby riders (promotes clustering)
+            existing_zips = [
+                unit_zip(eu)
+                for eu in vehicle_assignments[vi]
+            ]
+            neighbor_bonus = 0.0
+            if existing_zips:
+                min_existing_dist = min(
+                    approx_dist_mi(uz, ez) for ez in existing_zips if ez
+                ) if existing_zips else 99.0
+                neighbor_bonus = -min(2.0, max(0.0, 2.0 - min_existing_dist))
+            score = geo + neighbor_bonus
+            if score < best_score:
+                best_score = score
                 best_vi = vi
+        return best_vi  # may be None if truly all full
 
-        if best_vi is None:
-            # Try partial fit (first vehicle with any space)
-            for vi, veh in enumerate(veh_objects):
-                if vehicle_counts[vi] < veh.capacity:
-                    best_vi = vi
-                    break
+    # Two-pass: first pass respects geography; second pass fills any stragglers
+    unplaced: list[list[Student]] = []
+    for unit in all_units:
+        vi = best_vehicle_for_unit(unit, vehicle_counts)
+        if vi is not None:
+            vehicle_assignments[vi].append(unit)
+            vehicle_counts[vi] += len(unit)
+        else:
+            unplaced.append(unit)
 
-        if best_vi is None:
-            unassigned.append(cluster)
-            continue
-
-        vehicle_assignments[best_vi].append(cluster)
-        vehicle_counts[best_vi] += cluster_size
-
-    # Second pass: place any overflow in least-full vehicle
-    for cluster in unassigned:
-        best_vi = min(range(len(veh_objects)), key=lambda i: vehicle_counts[i])
-        vehicle_assignments[best_vi].append(cluster)
-        vehicle_counts[best_vi] += sum(len(u) for u in cluster)
+    # Second pass: place unplaced units in the vehicle with most remaining room
+    for unit in unplaced:
+        unit_size = len(unit)
+        # Find vehicle with most remaining capacity that can still fit this unit
+        candidates = [
+            (veh_objects[vi].capacity - vehicle_counts[vi], vi)
+            for vi in range(len(veh_objects))
+            if veh_objects[vi].capacity - vehicle_counts[vi] >= unit_size
+        ]
+        if candidates:
+            vi = max(candidates)[1]
+        else:
+            # Absolute last resort: least-over-capacity vehicle
+            vi = min(range(len(veh_objects)), key=lambda i: vehicle_counts[i])
+        vehicle_assignments[vi].append(unit)
+        vehicle_counts[vi] += unit_size
 
     # --- Step 5: Build stops and sequence them ---
     for vi, veh in enumerate(veh_objects):
@@ -466,14 +465,14 @@ def cluster_students(students: list[Student], vehicles: list[dict]) -> list[Vehi
             continue
 
         # Aggregate family units into address-keyed stops
+        # vehicle_assignments[vi] is a flat list of family units (lists of Student)
         addr_stop: dict[str, Stop] = {}
-        for cluster in assigned_clusters:
-            for unit in cluster:
-                rep = unit[0]
-                key = rep.address.lower().strip()
-                if key not in addr_stop:
-                    addr_stop[key] = Stop(address=rep.full_address)
-                addr_stop[key].riders.extend(unit)
+        for unit in assigned_clusters:
+            rep = unit[0]
+            key = rep.address.lower().strip()
+            if key not in addr_stop:
+                addr_stop[key] = Stop(address=rep.full_address)
+            addr_stop[key].riders.extend(unit)
 
         # Sort: furthest from destination first
         sorted_stops = sorted(
