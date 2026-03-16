@@ -546,6 +546,12 @@ label.lbl{display:block;font-size:.75rem;font-weight:600;color:var(--brand-dark)
     <div class="empty-icon">🗺️</div>
     <p>No routes generated yet.<br>Go to <strong>Setup</strong> and click <em>Generate Route Plan</em>.</p>
   </div>
+  <div id="results-stale" style="display:none">
+    <div style="background:var(--brand-light);border:1px solid #d4a0aa;border-radius:8px;padding:.6rem 1rem;font-size:.78rem;color:var(--brand-dark);margin-bottom:1rem;display:flex;align-items:center;gap:.5rem">
+      <span>📋</span>
+      <span>Showing results from your last run on <strong id="last-run-date"></strong> — generate a new plan to update</span>
+    </div>
+  </div>
 
   <div id="results-content" style="display:none">
 
@@ -855,10 +861,20 @@ function showDone(jobId, lines) {
 
   if (routeData) {
     buildResultsTab(routeData, jobId);
-    // Badge
     const badge = document.getElementById('results-badge');
     badge.textContent = routeData.length;
     badge.style.display = 'inline-block';
+
+    // Save to localStorage for next session
+    try {
+      const campAddr = document.getElementById('camp-address').value.trim();
+      localStorage.setItem('elbow_last_routes', JSON.stringify({
+        vehicles:   routeData,
+        savedAt:    new Date().toLocaleDateString('en-US', {month:'short', day:'numeric', year:'numeric', hour:'numeric', minute:'2-digit'}),
+        tripDir:    tripDirection,
+        campAddr:   campAddr,
+      }));
+    } catch(e) { /* localStorage not available */ }
   }
 }
 
@@ -873,6 +889,8 @@ document.getElementById('view-results-btn').addEventListener('click', () => {
 function buildResultsTab(vehicles, jobId) {
   document.getElementById('results-empty').style.display = 'none';
   document.getElementById('results-content').style.display = 'block';
+  // Hide stale banner if this is a fresh run
+  if (jobId) document.getElementById('results-stale').style.display = 'none';
 
   const totalRiders = vehicles.reduce((s, v) => s + v.rider_count, 0);
   const totalCap    = vehicles.reduce((s, v) => s + v.capacity, 0);
@@ -1146,6 +1164,31 @@ function showError(msg) {
 
 // ── Init ───────────────────────────────────────────────────────────────────
 renderFleet();
+
+// Load previous results from localStorage if available
+try {
+  const saved = localStorage.getItem('elbow_last_routes');
+  if (saved) {
+    const parsed = JSON.parse(saved);
+    if (parsed.vehicles && parsed.vehicles.length > 0) {
+      // Restore camp address and trip direction
+      if (parsed.campAddr) document.getElementById('camp-address').value = parsed.campAddr;
+      if (parsed.tripDir)  setTrip(parsed.tripDir);
+
+      // Show stale banner with date
+      document.getElementById('last-run-date').textContent = parsed.savedAt;
+      document.getElementById('results-stale').style.display = 'block';
+
+      // Build results tab with saved data
+      buildResultsTab(parsed.vehicles, null);
+
+      // Show badge
+      const badge = document.getElementById('results-badge');
+      badge.textContent = parsed.vehicles.length;
+      badge.style.display = 'inline-block';
+    }
+  }
+} catch(e) { /* localStorage not available or corrupted */ }
 </script>
 </body>
 </html>
