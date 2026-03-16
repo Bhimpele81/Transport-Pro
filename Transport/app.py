@@ -267,6 +267,9 @@ label.lbl{display:block;font-size:.75rem;font-weight:600;color:var(--brand-dark)
 .fleet-chip{background:var(--brand-light);border:1px solid #d4a0aa;border-radius:20px;padding:.3rem .85rem;font-size:.75rem;font-weight:500;color:var(--brand-dark)}
 
 /* run button */
+.trip-btn{padding:.5rem 1.25rem;border:1.5px solid var(--border);border-radius:8px;background:#fff;color:#888;font-family:'Roboto Slab',serif;font-size:.78rem;font-weight:600;letter-spacing:.04em;text-transform:uppercase;cursor:pointer;transition:all .15s;white-space:nowrap}
+.trip-btn.active{background:var(--brand);border-color:var(--brand);color:#fff}
+.trip-btn:hover:not(.active){border-color:var(--brand-mid);color:var(--brand-mid)}
 .run-btn{width:100%;padding:.95rem 2rem;background:var(--brand);color:#fff;border:none;border-radius:var(--r);font-family:'Roboto Slab',serif;font-size:1.05rem;font-weight:700;letter-spacing:.02em;text-transform:uppercase;cursor:pointer;display:flex;align-items:center;justify-content:center;gap:.65rem;transition:background .18s,transform .1s,box-shadow .18s;box-shadow:0 4px 14px rgba(109,31,47,.3);margin-top:1.25rem}
 .run-btn:hover:not(:disabled){background:var(--brand-dark);box-shadow:0 6px 20px rgba(109,31,47,.4);transform:translateY(-1px)}
 .run-btn:disabled{opacity:.55;cursor:not-allowed;transform:none;box-shadow:none}
@@ -407,10 +410,10 @@ label.lbl{display:block;font-size:.75rem;font-weight:600;color:var(--brand-dark)
         <label class="lbl">Trip Direction</label>
         <div style="display:flex;gap:.5rem">
           <button class="trip-btn active" id="btn-morning" onclick="setTrip('morning')">
-            🌅 Morning
+            Morning
           </button>
           <button class="trip-btn" id="btn-afternoon" onclick="setTrip('afternoon')">
-            🌇 Afternoon
+            Afternoon
           </button>
         </div>
         <div id="trip-hint" style="font-size:.72rem;color:#aaa;margin-top:.35rem;max-width:160px">
