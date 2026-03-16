@@ -151,6 +151,8 @@ class Vehicle:
     under_threshold: bool = False   # True when utilisation < MIN_UTIL
     start_lat: float   = 0.0
     start_lon: float   = 0.0
+    camp_lat:  float   = 0.0
+    camp_lon:  float   = 0.0
 
     @property
     def rider_count(self) -> int:
@@ -931,6 +933,10 @@ def cluster_and_route(students: list, vehicles: list,
             glat = sum(uc(u)[0] for u in group) / len(group)
             glon = sum(uc(u)[1] for u in group) / len(group)
             
+            # Max distance a group can be scattered — prevents mixing
+            # students from completely different geographic areas
+            MAX_SCATTER_MI = 5.0
+
             best_vi, best_d = None, float("inf")
             for vi_dst in range(len(veh_objects)):
                 if vi_dst == vi_src: continue
@@ -938,10 +944,14 @@ def cluster_and_route(students: list, vehicles: list,
                 if assignments[vi_dst]:
                     d = min(haversine_mi(glat, glon, *uc(eu))
                             for eu in assignments[vi_dst])
+                    # Hard reject: too far from any existing stop on this vehicle
+                    if d > MAX_SCATTER_MI: continue
                 else:
                     d = haversine_mi(glat, glon,
                                      veh_objects[vi_dst].start_lat,
                                      veh_objects[vi_dst].start_lon)
+                    # Empty vehicle — only accept if start is reasonably close
+                    if d > MAX_SCATTER_MI * 2: continue
                 if d < best_d: best_d, best_vi = d, vi_dst
 
             if best_vi is not None:
@@ -1038,7 +1048,9 @@ def cluster_and_route(students: list, vehicles: list,
             mins = max(1, round(legs[i]))
             stop.drive_time = f"{mins} min from start" if i == 0 else f"{mins} min"
 
-        veh.stops = sorted_stops
+        veh.stops    = sorted_stops
+        veh.camp_lat = camp_lat
+        veh.camp_lon = camp_lon
 
         total_mins = round(sum(legs))
         if total_mins >= 60:
