@@ -55,7 +55,8 @@ def vehicles_to_json(vehicles: list) -> list:
 
 # ── Background worker ──────────────────────────────────────────────────────────
 
-def run_job(job_id: str, csv_text: str, vehicles_text: str):
+def run_job(job_id: str, csv_text: str, vehicles_text: str,
+           camp_address: str = None, trip_direction: str = "morning"):
     output_path = os.path.join("outputs", f"routes_{job_id}.xlsx")
 
     def progress(msg: str):
@@ -68,15 +69,17 @@ def run_job(job_id: str, csv_text: str, vehicles_text: str):
 
         students = parse_students_csv(csv_text)
         vcfgs    = parse_vehicles_text(vehicles_text)
-        vehicles = cluster_and_route(students, vcfgs, progress)
+        vehicles = cluster_and_route(students, vcfgs, progress,
+                                        camp_address=camp_address,
+                                        trip_direction=trip_direction)
 
         # Save Excel
         from openpyxl import Workbook
         from bus_route_optimizer import build_dashboard, build_vehicle_sheet
         wb = Workbook()
-        build_dashboard(wb, vehicles)
+        build_dashboard(wb, vehicles, camp_address=camp_address, trip_direction=trip_direction)
         for veh in vehicles:
-            build_vehicle_sheet(wb, veh)
+            build_vehicle_sheet(wb, veh, camp_address=camp_address, trip_direction=trip_direction)
         wb.save(output_path)
 
         progress("✅  Excel saved")
@@ -116,7 +119,9 @@ def api_run():
     if not vehicles_text:
         return jsonify({"error": "No fleet configuration provided"}), 400
 
-    csv_text = csv_file.read().decode("utf-8-sig", errors="replace")
+    csv_text      = csv_file.read().decode("utf-8-sig", errors="replace")
+    camp_address  = request.form.get("camp_address", "").strip() or None
+    trip_direction = request.form.get("trip_direction", "morning")
 
     try:
         students = parse_students_csv(csv_text)
@@ -143,7 +148,9 @@ def api_run():
         }
 
     threading.Thread(
-        target=run_job, args=(job_id, csv_text, vehicles_text), daemon=True
+        target=run_job,
+        args=(job_id, csv_text, vehicles_text, camp_address, trip_direction),
+        daemon=True
     ).start()
 
     return jsonify({"job_id": job_id})
@@ -373,12 +380,52 @@ label.lbl{display:block;font-size:.75rem;font-weight:600;color:var(--brand-dark)
 <!-- ══════════════ SETUP TAB ══════════════ -->
 <div class="tab-panel active" id="tab-setup">
 
+  <!-- Step 0: Camp location + trip direction -->
+  <div class="card">
+    <div class="card-hd">
+      <span class="card-num" style="background:var(--gold);color:#1a1018">★</span>
+      <div>
+        <div class="card-title">Trip Settings</div>
+        <div class="card-hint">Set the camp location and whether this is a morning or afternoon run</div>
+      </div>
+    </div>
+
+    <div style="display:grid;grid-template-columns:1fr auto;gap:1rem;align-items:start">
+      <div>
+        <label class="lbl" for="camp-address">Camp Address</label>
+        <input type="text" id="camp-address"
+               value="828 Elbow Lane, Warrington, PA 18976"
+               placeholder="828 Elbow Lane, Warrington, PA 18976"
+               style="width:100%;padding:.6rem .85rem;border:1.5px solid var(--border);border-radius:8px;font-family:'DM Sans',sans-serif;font-size:.88rem;color:var(--ink);background:var(--mist);transition:border-color .15s"
+               onfocus="this.style.borderColor='var(--brand-mid)';this.style.background='#fff'"
+               onblur="this.style.borderColor='var(--border)';this.style.background='var(--mist)'">
+        <div style="font-size:.72rem;color:#aaa;margin-top:.35rem">
+          This is the destination for morning routes and the starting point for afternoon routes
+        </div>
+      </div>
+      <div>
+        <label class="lbl">Trip Direction</label>
+        <div style="display:flex;gap:.5rem">
+          <button class="trip-btn active" id="btn-morning" onclick="setTrip('morning')">
+            🌅 Morning
+          </button>
+          <button class="trip-btn" id="btn-afternoon" onclick="setTrip('afternoon')">
+            🌇 Afternoon
+          </button>
+        </div>
+        <div id="trip-hint" style="font-size:.72rem;color:#aaa;margin-top:.35rem;max-width:160px">
+          Students travel <strong>to camp</strong>
+        </div>
+      </div>
+    </div>
+  </div>
+
   <!-- Step 1: CSV -->
   <div class="card">
     <div class="card-hd">
       <span class="card-num">1</span>
       <div>
-        <div class="card-title">Student Roster</div>
+        <div class="card-title" id="roster-title">Morning Roster</div>
         <div class="card-hint">Upload the CSV exported from your camp management software</div>
       </div>
     </div>
@@ -637,6 +684,24 @@ const csvInput   = document.getElementById('csv-file');
 const fileChosen = document.getElementById('file-chosen');
 
 let studentCount = 0;
+let tripDirection = "morning";
+
+function setTrip(dir) {
+  tripDirection = dir;
+  document.getElementById('btn-morning').classList.toggle('active', dir === 'morning');
+  document.getElementById('btn-afternoon').classList.toggle('active', dir === 'afternoon');
+  const hint = document.getElementById('trip-hint');
+  const title = document.getElementById('roster-title');
+  if (dir === 'afternoon') {
+    hint.innerHTML = 'Students travel <strong>home from camp</strong>';
+    title.textContent = 'Afternoon Roster';
+  } else {
+    hint.innerHTML = 'Students travel <strong>to camp</strong>';
+    title.textContent = 'Morning Roster';
+  }
+}
+
+let studentCount = 0;
 
 function setFile(file) {
   csvFile = file;
@@ -701,6 +766,8 @@ document.getElementById('run-btn').addEventListener('click', async () => {
   const fd = new FormData();
   fd.append('csv_file', csvFile);
   fd.append('vehicles_text', fleetToText());
+  fd.append('camp_address', document.getElementById('camp-address').value.trim());
+  fd.append('trip_direction', tripDirection);
 
   try {
     const res = await fetch('/api/run', {method:'POST', body:fd});
@@ -772,8 +839,11 @@ function buildResultsTab(vehicles, jobId) {
 
   const totalRiders = vehicles.reduce((s, v) => s + v.rider_count, 0);
   const totalCap    = vehicles.reduce((s, v) => s + v.capacity, 0);
+  const campAddr    = document.getElementById('camp-address').value.trim() || '828 Elbow Lane, Warrington, PA';
+  const dirLabel    = tripDirection === 'afternoon' ? 'All routes depart from' : 'All routes end at';
+  const tripLabel   = tripDirection === 'afternoon' ? '🌇 Afternoon run' : '🌅 Morning run';
   document.getElementById('summary-hint').textContent =
-    `${totalRiders} riders · ${totalCap} seats · ${vehicles.length} vehicles · All routes end at 828 Elbow Lane, Warrington, PA`;
+    `${tripLabel} · ${totalRiders} riders · ${totalCap} seats · ${vehicles.length} vehicles · ${dirLabel} ${campAddr}`;
 
   // Summary table
   const tbody = document.getElementById('summary-tbody');
