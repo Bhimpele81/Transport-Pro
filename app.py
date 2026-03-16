@@ -202,7 +202,7 @@ body{font-family:'DM Sans',sans-serif;background:var(--mist);color:var(--ink);mi
 
 /* header */
 header{background:var(--brand);color:#fff;padding:0 2rem;display:flex;align-items:center;gap:1.25rem;height:68px;box-shadow:0 2px 16px rgba(109,31,47,.35);position:sticky;top:0;z-index:200}
-.h-bus{font-size:1.9rem;line-height:1}
+.h-logo{width:48px;height:48px;border-radius:50%;object-fit:cover;flex-shrink:0;box-shadow:0 2px 8px rgba(0,0,0,.25)}
 .h-title{font-family:'Playfair Display',serif;font-size:1.3rem;font-weight:700}
 .h-sub{font-size:.78rem;opacity:.7;font-weight:300;margin-top:1px}
 .h-badge{margin-left:auto;background:rgba(255,255,255,.15);border:1px solid rgba(255,255,255,.3);color:#fff;font-size:.7rem;font-weight:600;letter-spacing:.08em;text-transform:uppercase;padding:.3rem .8rem;border-radius:20px;white-space:nowrap}
@@ -348,7 +348,7 @@ label.lbl{display:block;font-size:.75rem;font-weight:600;color:var(--brand-dark)
 <body>
 
 <header>
-  <span class="h-bus">🚌</span>
+  <img src="/static/logo.png" alt="Elbow Lane Day Camp" class="h-logo">
   <div>
     <div class="h-title">Elbow Lane Day Camp</div>
     <div class="h-sub">Bus Route Optimizer</div>
