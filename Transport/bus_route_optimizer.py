@@ -678,7 +678,9 @@ def parse_vehicles_text(text: str) -> list:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def cluster_and_route(students: list, vehicles: list,
-                      progress_cb: Optional[Callable] = None) -> list:
+                      progress_cb: Optional[Callable] = None,
+                      camp_address: str = None,
+                      trip_direction: str = "morning") -> list:
     """
     Full pipeline:
     1. Geocode every address (OpenStreetMap — real lat/lon, ZIP ignored)
@@ -687,17 +689,25 @@ def cluster_and_route(students: list, vehicles: list,
     4. Assign whole clusters to vehicles (nearest start, strict capacity)
     5. Consolidate under-filled vehicles (full merge, then scatter)
     6. Remove empty vehicles from output
-    7. Sequence stops: furthest from camp first (no backtracking)
+    7. Sequence stops:
+       - Morning: furthest from camp first (no backtracking toward camp)
+       - Afternoon: nearest to camp first (route away from camp)
     8. Get driving times via OSRM (or road-factor fallback)
+
+    Args:
+        camp_address:    Override the default camp address
+        trip_direction:  "morning" (routes end at camp) or
+                         "afternoon" (routes start at camp, end at homes)
     """
+    effective_camp = camp_address or CAMP_ADDRESS
 
     # ── 1. Geocode ────────────────────────────────────────────────────────
     all_addrs = list({s.full_address for s in students}
                      | {v["start"] for v in vehicles}
-                     | {CAMP_ADDRESS})
+                     | {effective_camp})
     coords = geocode_all_addresses(all_addrs, progress_cb)
 
-    camp_lat, camp_lon = coords.get(CAMP_ADDRESS, CAMP_COORDS)
+    camp_lat, camp_lon = coords.get(effective_camp, CAMP_COORDS)
     for s in students:
         s.lat, s.lon = coords.get(s.full_address, CAMP_COORDS)
         s.geocoded   = (s.lat, s.lon) != CAMP_COORDS
@@ -944,25 +954,30 @@ def cluster_and_route(students: list, vehicles: list,
         def dist_to_camp_s(s):
             return haversine_mi(s.lat, s.lon, camp_lat, camp_lon)
 
-        # Start the route from the stop farthest from camp
-        # (ensures we're heading toward camp throughout the route)
-        first = max(unvisited, key=dist_to_camp_s)
+        # Sequence stops using nearest-neighbor TSP with directional bias:
+        # Morning:   start from farthest stop, work toward camp (no backtracking)
+        # Afternoon: start from nearest stop to camp, work away from camp
+        if trip_direction == "afternoon":
+            first = min(unvisited, key=dist_to_camp_s)
+        else:
+            first = max(unvisited, key=dist_to_camp_s)
         sorted_stops = [first]
         unvisited.remove(first)
 
         while unvisited:
             last = sorted_stops[-1]
-            # From current position, find nearest unvisited stop
-            # Slight bias: prefer stops that are also closer to camp
-            # (weight = geographic distance + 0.3 × extra distance-from-camp)
             cur_d2c = dist_to_camp_s(last)
             best_stop, best_score = None, float("inf")
             for s in unvisited:
                 geo_d = haversine_mi(last.lat, last.lon, s.lat, s.lon)
-                # Small penalty if this stop is farther from camp than where we are
-                # (discourages backtracking but doesn't prevent necessary turns)
                 d2c_s = dist_to_camp_s(s)
-                backtrack_penalty = max(0.0, d2c_s - cur_d2c) * 0.5
+                if trip_direction == "afternoon":
+                    # Afternoon: penalise stops that are closer to camp
+                    # (encourages routing away from camp, not back toward it)
+                    backtrack_penalty = max(0.0, cur_d2c - d2c_s) * 0.5
+                else:
+                    # Morning: penalise stops that are farther from camp
+                    backtrack_penalty = max(0.0, d2c_s - cur_d2c) * 0.5
                 score = geo_d + backtrack_penalty
                 if score < best_score:
                     best_score, best_stop = score, s
@@ -1013,7 +1028,7 @@ def _align(h="left", v="center", wrap=False):
 def _bdr(**kw): return Border(**kw)
 
 
-def build_dashboard(wb: Workbook, vehicles: list):
+def build_dashboard(wb: Workbook, vehicles: list, camp_address: str = None, trip_direction: str = "morning"):
     ws = wb.active
     ws.title = "Route Summary"
     for col, w in zip("ABCDEFGH", [18, 54, 10, 10, 9, 16, 13, 10]):
@@ -1031,7 +1046,9 @@ def build_dashboard(wb: Workbook, vehicles: list):
     # Subtitle
     ws.merge_cells("A2:H2")
     c = ws["A2"]
-    c.value = ("All vehicles finish at: 828 Elbow Lane, Warrington, PA  |  "
+    camp_display = camp_address or CAMP_ADDRESS
+    direction_label = "All vehicles depart from" if trip_direction == "afternoon" else "All vehicles finish at"
+    c.value = (f"{direction_label}: {camp_display}  |  "
                "Clustered by real street-address proximity (OpenStreetMap)  |  "
                "Drive times via OSRM road-network routing")
     c.font      = _font(size=9, italic=True, color="444444")
@@ -1112,7 +1129,7 @@ def build_dashboard(wb: Workbook, vehicles: list):
     ws.row_dimensions[lr].height = 28
 
 
-def build_vehicle_sheet(wb: Workbook, veh: Vehicle):
+def build_vehicle_sheet(wb: Workbook, veh: Vehicle, camp_address: str = None, trip_direction: str = "morning"):
     ws = wb.create_sheet(title=veh.name)
     for col, w in zip("ABCDE", [9, 40, 28, 12, 22]):
         ws.column_dimensions[col].width = w
@@ -1179,7 +1196,10 @@ def build_vehicle_sheet(wb: Workbook, veh: Vehicle):
     else:
         arrive_time = "— → ARRIVE"
 
-    for ci, val in enumerate(["ARRIVE", "828 Elbow Lane, Warrington, PA",
+    arrive_label = camp_address or CAMP_ADDRESS
+    dest_display = arrive_label.split(",")[0] if "," in arrive_label else arrive_label
+    action_word = "DEPART" if trip_direction == "afternoon" else "ARRIVE"
+    for ci, val in enumerate([action_word, arrive_label,
                                "—", "—", arrive_time], 1):
         cell = ws.cell(row=arrive, column=ci, value=val)
         cell.font      = _font(bold=True, color="006400")
@@ -1216,9 +1236,16 @@ def generate_routes(
     output_path: str = "bus_routes_output.xlsx",
     route_data: Optional[list] = None,
     progress_cb: Optional[Callable] = None,
+    camp_address: str = None,
+    trip_direction: str = "morning",
 ) -> str:
     """
     Parse → geocode → cluster → assign → consolidate → Excel.
+
+    Args:
+        camp_address:    Camp destination/origin (defaults to 828 Elbow Lane)
+        trip_direction:  "morning" (students travel TO camp) or
+                         "afternoon" (students travel FROM camp HOME)
     Returns output_path on success.
     """
     students = parse_students_csv(csv_text)
@@ -1237,12 +1264,14 @@ def generate_routes(
     if route_data:
         vehicles = _apply_ai_routes(vehicle_configs, route_data)
     else:
-        vehicles = cluster_and_route(students, vehicle_configs, progress_cb)
+        vehicles = cluster_and_route(students, vehicle_configs, progress_cb,
+                                          camp_address=camp_address,
+                                          trip_direction=trip_direction)
 
     wb = Workbook()
-    build_dashboard(wb, vehicles)
+    build_dashboard(wb, vehicles, camp_address=camp_address, trip_direction=trip_direction)
     for veh in vehicles:
-        build_vehicle_sheet(wb, veh)
+        build_vehicle_sheet(wb, veh, camp_address=camp_address, trip_direction=trip_direction)
 
     wb.save(output_path)
     if progress_cb:
