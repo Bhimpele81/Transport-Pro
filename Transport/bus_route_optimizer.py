@@ -308,7 +308,7 @@ def _in_pa(lat: float, lon: float) -> bool:
 # it's treated as a wrong result and retried.
 # This catches cases like "108 Country Ln, Lansdale, PA 19446" resolving
 # to a "Country Ln" in another state or county.
-MAX_ZIP_DEVIATION_MI = 5.0   # max acceptable distance from ZIP centroid
+MAX_ZIP_DEVIATION_MI = 3.0   # max acceptable distance from ZIP centroid
 
 # These are rough ZIP centroids for areas around the camp.
 # Any PA address not in this table falls back to PA-bounds-only validation.
@@ -366,11 +366,24 @@ def _geocode_one(address: str, cache: dict, progress_cb=None) -> tuple:
 
     if key in cache:
         cached = tuple(cache[key])
-        if _in_pa(*cached) and cached != CAMP_COORDS:
-            zip5 = _extract_zip5(address)
-            if _result_near_zip(*cached, zip5):
-                return cached
-        del cache[key]   # bad cached result — re-geocode
+        zip5_check = _extract_zip5(address)
+        # Validate cached result: must be in PA AND near expected ZIP centroid
+        if (_in_pa(*cached)
+                and cached != CAMP_COORDS
+                and _result_near_zip(*cached, zip5_check)):
+            return cached
+        # Bad cached entry — remove it and all stale route-time entries
+        if progress_cb:
+            progress_cb(f"  Clearing bad cached coord for {address}: {cached}")
+        # Wipe stale route times that used the bad coord
+        rcache = _load_json(ROUTECACHE_FILE)
+        bad_prefix = f"{cached[0]:.5f},{cached[1]:.5f}"
+        stale = [k for k in rcache if bad_prefix in k]
+        for k in stale:
+            del rcache[k]
+        if stale:
+            _save_json(ROUTECACHE_FILE, rcache)
+        del cache[key]   # remove bad geocache entry — will re-geocode
 
     if progress_cb:
         progress_cb(f"  Geocoding: {address}")
@@ -468,28 +481,71 @@ def _geocode_one(address: str, cache: dict, progress_cb=None) -> tuple:
     return CAMP_COORDS
 
 
+def _purge_bad_geocache(cache: dict, addresses: list, progress_cb=None) -> int:
+    """
+    Scan the geocache for entries with coordinates that fail ZIP validation.
+    Removes them so they will be re-geocoded correctly on the next run.
+    Called automatically at the start of every geocode_all_addresses call.
+    Returns number of bad entries removed.
+    """
+    rcache = _load_json(ROUTECACHE_FILE)
+    removed = 0
+    for addr in addresses:
+        key = addr.strip().lower()
+        if key not in cache:
+            continue
+        cached = tuple(cache[key])
+        zip5 = _extract_zip5(addr)
+        is_bad = (
+            cached == CAMP_COORDS
+            or not _in_pa(*cached)
+            or not _result_near_zip(*cached, zip5)
+        )
+        if is_bad:
+            # Also wipe any route-time cache entries that used these bad coords
+            bad_prefix = f"{cached[0]:.5f},{cached[1]:.5f}"
+            stale_routes = [k for k in rcache if bad_prefix in k]
+            for k in stale_routes:
+                del rcache[k]
+            del cache[key]
+            removed += 1
+            if progress_cb:
+                progress_cb(f"  Purged bad geocache entry: {addr} was {cached}")
+    if removed:
+        _save_json(GEOCACHE_FILE, cache)
+        _save_json(ROUTECACHE_FILE, rcache)
+    return removed
+
+
 def geocode_all_addresses(addresses: list, progress_cb=None) -> dict:
     """
     Geocode a list of addresses → {address: (lat, lon)}.
 
     Fully self-healing — no manual cache management needed:
-    • Addresses already geocoded correctly are returned instantly from cache
-    • Any cached address with coordinates outside Pennsylvania is automatically
-      detected, removed from cache, and re-geocoded correctly
-    • Route-time cache entries tied to bad coordinates are also cleared
+    • Scans and purges any cached coordinates that fail ZIP-centroid validation
+    • This automatically fixes bad Nominatim results from previous runs
+    • Addresses geocoded correctly are returned instantly from cache
+    • New/purged addresses are re-geocoded using the 4-pass robust strategy
     • First run: ~1 second per new address (Nominatim rate limit)
-    • Subsequent runs with same addresses: instant
+    • Subsequent runs: instant (unless previous results were bad)
     """
     cache = _load_json(GEOCACHE_FILE)
 
-    # Find addresses that need (re)geocoding — either not cached or
-    # cached with bad coordinates (outside PA or stuck at camp fallback)
+    # Always purge bad entries first — fixes stale wrong coords automatically
+    purged = _purge_bad_geocache(cache, addresses, progress_cb)
+    if purged and progress_cb:
+        progress_cb(f"  Purged {purged} bad geocache entries — will re-geocode")
+
+    # Find addresses that still need geocoding after purge
     def needs_geocode(a: str) -> bool:
         key = a.strip().lower()
         if key not in cache:
             return True
         cached = tuple(cache[key])
-        return cached == CAMP_COORDS or not _in_pa(*cached)
+        if cached == CAMP_COORDS or not _in_pa(*cached):
+            return True
+        zip5 = _extract_zip5(a)
+        return not _result_near_zip(*cached, zip5)
 
     # Identify addresses with bad cached coords so we can also
     # wipe their stale route-time cache entries
