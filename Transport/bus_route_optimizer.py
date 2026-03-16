@@ -28,6 +28,7 @@ from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 
 # ── Brand / tuneable constants ────────────────────────────────────────────────
+GOOGLE_MAPS_KEY = os.environ.get("GOOGLE_MAPS_KEY", "")   # set in Replit Secrets
 CAMP_ADDRESS    = "828 Elbow Lane, Warrington, PA 18976"
 CAMP_COORDS     = (40.2454, -75.1407)   # fallback if geocode fails
 GEOCACHE_FILE   = "geocache.json"        # on-disk cache for lat/lon lookups
@@ -244,16 +245,38 @@ def _fallback_minutes(lat1, lon1, lat2, lon2) -> float:
 
 def driving_minutes(lat1, lon1, lat2, lon2, cache: dict) -> float:
     """
-    Real driving time in minutes via OSRM (free road-network API).
-    Falls back to road-factor haversine estimate if OSRM is unreachable.
+    Real driving time in minutes via Google Directions API.
+    Falls back to OSRM, then road-factor haversine estimate if unavailable.
     Results cached in routecache.json so each pair is only queried once.
     """
     key = f"{lat1:.5f},{lon1:.5f}|{lat2:.5f},{lon2:.5f}"
     if key in cache:
         return cache[key]
 
+    # ── Try Google Directions API first ──────────────────────────────────
+    if GOOGLE_MAPS_KEY:
+        try:
+            params = urllib.parse.urlencode({
+                "origin":      f"{lat1},{lon1}",
+                "destination": f"{lat2},{lon2}",
+                "mode":        "driving",
+                "key":         GOOGLE_MAPS_KEY,
+            })
+            url = f"https://maps.googleapis.com/maps/api/directions/json?{params}"
+            req = urllib.request.Request(url,
+                headers={"User-Agent": "ElbowLaneCampBusRouter/1.0"})
+            with urllib.request.urlopen(req, timeout=8) as resp:
+                data = json.loads(resp.read().decode())
+            if data.get("status") == "OK":
+                mins = data["routes"][0]["legs"][0]["duration"]["value"] / 60.0
+                cache[key] = mins
+                _save_json(ROUTECACHE_FILE, cache)
+                return mins
+        except Exception:
+            pass   # fall through to OSRM
+
+    # ── Fallback: OSRM ───────────────────────────────────────────────────
     try:
-        # OSRM wants lon,lat order
         url = (f"http://router.project-osrm.org/route/v1/driving/"
                f"{lon1:.6f},{lat1:.6f};{lon2:.6f},{lat2:.6f}"
                f"?overview=false")
@@ -267,8 +290,9 @@ def driving_minutes(lat1, lon1, lat2, lon2, cache: dict) -> float:
             _save_json(ROUTECACHE_FILE, cache)
             return mins
     except Exception:
-        pass   # network blocked or rate-limited → use fallback
+        pass
 
+    # ── Final fallback: road-factor haversine ─────────────────────────────
     mins = _fallback_minutes(lat1, lon1, lat2, lon2)
     cache[key] = mins
     _save_json(ROUTECACHE_FILE, cache)
@@ -339,25 +363,15 @@ def _result_near_zip(lat: float, lon: float, zip5: str) -> bool:
 
 def _geocode_one(address: str, cache: dict, progress_cb=None) -> tuple:
     """
-    Robust geocoding for any US address, hardened against wrong-state results.
+    Geocode one address using Google Geocoding API (primary) with
+    Nominatim as fallback if Google is unavailable.
 
-    Strategy (four passes, each more specific):
-      1. Nominatim structured search: street + city + state=Pennsylvania (bounded)
-         → impossible to return results from another state
-      2. Free-text search with viewbox HARD-BOUNDED to Pennsylvania
-         → bounded=1 means Nominatim ONLY returns results inside the viewbox
-      3. Simplified query (street + city + Pennsylvania) bounded to PA box
-      4. ZIP centroid fallback with warning
-
-    Each result is validated against:
-      a) Pennsylvania lat/lon bounds
-      b) Proximity to the expected ZIP code centroid (within 8 miles)
-
-    This approach works reliably for any address in any future roster.
+    Results are validated against Pennsylvania bounds and ZIP centroid
+    proximity regardless of which service returns them.
     """
     key = address.strip().lower()
 
-    # Override file always wins (allows permanent fixes for any address)
+    # Override file always wins
     overrides = _load_overrides()
     if key in overrides:
         lat, lon = float(overrides[key][0]), float(overrides[key][1])
@@ -367,15 +381,13 @@ def _geocode_one(address: str, cache: dict, progress_cb=None) -> tuple:
     if key in cache:
         cached = tuple(cache[key])
         zip5_check = _extract_zip5(address)
-        # Validate cached result: must be in PA AND near expected ZIP centroid
         if (_in_pa(*cached)
                 and cached != CAMP_COORDS
                 and _result_near_zip(*cached, zip5_check)):
             return cached
-        # Bad cached entry — remove it and all stale route-time entries
+        # Bad cached entry — purge it and stale route times
         if progress_cb:
             progress_cb(f"  Clearing bad cached coord for {address}: {cached}")
-        # Wipe stale route times that used the bad coord
         rcache = _load_json(ROUTECACHE_FILE)
         bad_prefix = f"{cached[0]:.5f},{cached[1]:.5f}"
         stale = [k for k in rcache if bad_prefix in k]
@@ -383,12 +395,12 @@ def _geocode_one(address: str, cache: dict, progress_cb=None) -> tuple:
             del rcache[k]
         if stale:
             _save_json(ROUTECACHE_FILE, rcache)
-        del cache[key]   # remove bad geocache entry — will re-geocode
+        del cache[key]
 
     if progress_cb:
         progress_cb(f"  Geocoding: {address}")
 
-    zip5 = _extract_zip5(address)
+    zip5  = _extract_zip5(address)
     parts = [p.strip() for p in address.split(",")]
     street = parts[0] if parts else address
     city   = parts[1] if len(parts) > 1 else ""
@@ -396,8 +408,34 @@ def _geocode_one(address: str, cache: dict, progress_cb=None) -> tuple:
     def _validate(lat, lon) -> bool:
         return _in_pa(lat, lon) and _result_near_zip(lat, lon, zip5)
 
-    def _structured_query() -> tuple:
-        """Pass 1: Nominatim structured search locked to Pennsylvania."""
+    result = None
+
+    # ── Pass 1: Google Geocoding API ──────────────────────────────────────
+    if GOOGLE_MAPS_KEY:
+        try:
+            params = urllib.parse.urlencode({
+                "address":    address,
+                "components": "country:US|administrative_area:PA",
+                "key":        GOOGLE_MAPS_KEY,
+            })
+            url = f"https://maps.googleapis.com/maps/api/geocode/json?{params}"
+            req = urllib.request.Request(url,
+                headers={"User-Agent": "ElbowLaneCampBusRouter/1.0"})
+            with urllib.request.urlopen(req, timeout=8) as resp:
+                data = json.loads(resp.read().decode())
+            if data.get("status") == "OK" and data.get("results"):
+                loc = data["results"][0]["geometry"]["location"]
+                lat, lon = float(loc["lat"]), float(loc["lng"])
+                if _validate(lat, lon):
+                    result = (lat, lon)
+                elif progress_cb:
+                    progress_cb(f"  ⚠ Google result out of PA bounds for {address} — trying Nominatim")
+        except Exception as e:
+            if progress_cb:
+                progress_cb(f"  ⚠ Google geocode error: {e}")
+
+    # ── Pass 2: Nominatim structured (fallback) ───────────────────────────
+    if result is None:
         try:
             params = urllib.parse.urlencode({
                 "street":  street,
@@ -417,22 +455,21 @@ def _geocode_one(address: str, cache: dict, progress_cb=None) -> tuple:
             for r in results:
                 lat, lon = float(r["lat"]), float(r["lon"])
                 if _validate(lat, lon):
-                    return lat, lon
-        except Exception as e:
-            if progress_cb:
-                progress_cb(f"  ⚠ Structured query error: {e}")
-        return None
+                    result = (lat, lon)
+                    break
+        except Exception:
+            pass
 
-    def _bounded_query(q: str) -> tuple:
-        """Pass 2/3: Free-text search HARD-BOUNDED to Pennsylvania box."""
+    # ── Pass 3: Nominatim hard-bounded free-text ──────────────────────────
+    if result is None:
         try:
             params = urllib.parse.urlencode({
-                "q":       q,
+                "q":       address,
                 "format":  "json",
                 "limit":   5,
                 "addressdetails": 0,
                 "viewbox": "-80.5,39.7,-74.7,42.3",
-                "bounded": 1,   # HARD bound — only return PA results
+                "bounded": 1,
             })
             req = urllib.request.Request(
                 f"https://nominatim.openstreetmap.org/search?{params}",
@@ -443,29 +480,16 @@ def _geocode_one(address: str, cache: dict, progress_cb=None) -> tuple:
             for r in results:
                 lat, lon = float(r["lat"]), float(r["lon"])
                 if _validate(lat, lon):
-                    return lat, lon
-        except Exception as e:
-            if progress_cb:
-                progress_cb(f"  ⚠ Bounded query error: {e}")
-        return None
+                    result = (lat, lon)
+                    break
+        except Exception:
+            pass
 
-    # Pass 1: structured (state=Pennsylvania, impossible to get wrong state)
-    result = _structured_query()
-
-    # Pass 2: hard-bounded free-text
-    if result is None:
-        result = _bounded_query(address)
-
-    # Pass 3: simplified address hard-bounded
-    if result is None and city:
-        result = _bounded_query(f"{street}, {city}, Pennsylvania")
-
-    # Pass 4: ZIP centroid fallback
+    # ── Pass 4: ZIP centroid fallback ─────────────────────────────────────
     if result is None and zip5 in ZIP_CENTROIDS:
         lat, lon = ZIP_CENTROIDS[zip5]
         if progress_cb:
-            progress_cb(f"  ⚠ Using ZIP centroid for '{address}' "
-                        f"({lat:.4f}, {lon:.4f}) — addresses on this route may be approximate")
+            progress_cb(f"  ⚠ Using ZIP centroid for '{address}' — may be approximate")
         result = (lat, lon)
 
     if result is not None:
