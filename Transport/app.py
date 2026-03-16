@@ -103,7 +103,10 @@ def run_job(job_id: str, csv_text: str, vehicles_text: str,
 
 @app.route("/")
 def index():
-    return render_template_string(HTML)
+    key = os.environ.get("GOOGLE_MAPS_KEY", "")
+    return render_template_string(HTML.replace(
+        '"{{ google_maps_key }}"', f'"{key}"'
+    ))
 
 @app.route("/logo.png")
 def serve_logo():
@@ -206,8 +209,10 @@ HTML = r"""<!DOCTYPE html>
 <meta http-equiv="Pragma" content="no-cache">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Elbow Lane — Bus Route Optimizer</title>
-<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/leaflet@1.9.4/dist/leaflet.min.css">
-<script src="https://cdn.jsdelivr.net/npm/leaflet@1.9.4/dist/leaflet.min.js"></script>
+<script>
+// Google Maps API key injected from server
+window.GOOGLE_MAPS_KEY = "{{ google_maps_key }}";
+</script>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Roboto+Slab:wght@600;700;800&family=DM+Sans:ital,wght@0,300;0,400;0,500;0,600;1,400&display=swap" rel="stylesheet">
 <style>
@@ -1011,115 +1016,160 @@ function buildResultsTab(vehicles, jobId) {
   });
 }
 
-// ── Vehicle map ────────────────────────────────────────────────────────────
-const leafletMaps = {};  // store map instances to avoid re-init
+// ── Vehicle map (Google Maps) ───────────────────────────────────────────────
+const initializedMaps = {};
+let googleMapsLoaded  = false;
+let googleMapsLoading = false;
+const mapQueue = [];
 
-async function initVehicleMap(mapId, vehicle) {
+function loadGoogleMapsAPI() {
+  if (googleMapsLoaded || googleMapsLoading) return;
+  googleMapsLoading = true;
+  const script = document.createElement('script');
+  script.src = `https://maps.googleapis.com/maps/api/js?key=${window.GOOGLE_MAPS_KEY}&libraries=geometry&callback=onGoogleMapsLoaded`;
+  script.async = true;
+  document.head.appendChild(script);
+}
+
+window.onGoogleMapsLoaded = function() {
+  googleMapsLoaded  = true;
+  googleMapsLoading = false;
+  mapQueue.forEach(fn => fn());
+  mapQueue.length = 0;
+};
+
+function initVehicleMap(mapId, vehicle) {
   const el = document.getElementById(mapId);
-  if (!el || leafletMaps[mapId]) return;
+  if (!el || initializedMaps[mapId]) return;
 
-  // Gather all coordinates: start → stops → camp
   const campAddr = document.getElementById('camp-address').value.trim() || '828 Elbow Lane, Warrington, PA 18976';
   const allPoints = [];
 
-  // Vehicle start
   if (vehicle.start_lat && vehicle.start_lon) {
-    allPoints.push({lat: vehicle.start_lat, lon: vehicle.start_lon, label: 'START', type: 'start'});
+    allPoints.push({lat: vehicle.start_lat, lng: vehicle.start_lon, type: 'start'});
   }
-  // Stops in order
   vehicle.stops.forEach((s, i) => {
     if (s.lat && s.lon && (s.lat !== 0 || s.lon !== 0)) {
-      allPoints.push({lat: s.lat, lon: s.lon, label: String(i+1), type: 'stop',
+      allPoints.push({lat: s.lat, lng: s.lon, label: String(i+1), type: 'stop',
                       riders: s.rider_names, address: s.address.split(',')[0]});
     }
   });
-  // Camp (use last stop coords + direction to camp, or hardcoded)
-  allPoints.push({lat: 40.2454, lon: -75.1407, label: '⛳', type: 'camp'});
+  allPoints.push({lat: 40.2454, lng: -75.1407, type: 'camp'});
 
   if (allPoints.length < 2) {
-    el.innerHTML = '<div class="map-loading">No coordinates available for this route</div>';
+    el.innerHTML = '<div class="map-loading">No coordinates available</div>';
     return;
   }
 
-  // Clear loading message and ensure container is visible before init
-  el.innerHTML = '';
-  el.style.display = 'block';
-  // Small delay to let CSS finish showing the accordion body
-  await new Promise(r => setTimeout(r, 100));
-  
-  const map = L.map(el, {zoomControl: true, scrollWheelZoom: false});
-  leafletMaps[mapId] = map;
-
-  L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-    attribution: '© OpenStreetMap contributors',
-    maxZoom: 18,
-  }).addTo(map);
-
-  // Brand colors
-  const BRAND    = '#6D1F2F';
-  const GOLD     = '#c9a84c';
-  const GREEN    = '#2d6a4f';
-
-  // Custom marker factory
-  function makeMarker(label, color, textColor='#fff', size=28) {
-    return L.divIcon({
-      html: `<div style="width:${size}px;height:${size}px;background:${color};border:2px solid #fff;
-             border-radius:50%;display:flex;align-items:center;justify-content:center;
-             font-size:${size<=28?'11':'13'}px;font-weight:700;color:${textColor};
-             font-family:'Roboto Slab',serif;box-shadow:0 2px 6px rgba(0,0,0,.3)">${label}</div>`,
-      className: '',
-      iconSize: [size, size],
-      iconAnchor: [size/2, size/2],
-    });
+  if (!googleMapsLoaded) {
+    loadGoogleMapsAPI();
+    mapQueue.push(() => renderGoogleMap(el, mapId, allPoints, vehicle, campAddr));
+    return;
   }
+  renderGoogleMap(el, mapId, allPoints, vehicle, campAddr);
+}
 
-  // Add markers
-  allPoints.forEach(pt => {
-    let marker;
-    if (pt.type === 'start') {
-      marker = L.marker([pt.lat, pt.lon], {icon: makeMarker('▶', BRAND, '#fff', 32)});
-      marker.bindPopup(`<strong>Start</strong><br>${vehicle.start_address}`);
-    } else if (pt.type === 'camp') {
-      marker = L.marker([pt.lat, pt.lon], {icon: makeMarker('⛳', GREEN, '#fff', 32)});
-      marker.bindPopup(`<strong>Camp</strong><br>${campAddr}`);
-    } else {
-      marker = L.marker([pt.lat, pt.lon], {icon: makeMarker(pt.label, GOLD, '#1a1018', 28)});
-      marker.bindPopup(`<strong>Stop ${pt.label}</strong><br>${pt.address}<br><em>${pt.riders}</em>`);
-    }
-    marker.addTo(map);
+function renderGoogleMap(el, mapId, allPoints, vehicle, campAddr) {
+  el.innerHTML = '';
+  initializedMaps[mapId] = true;
+
+  const BRAND = '#6D1F2F';
+  const GOLD  = '#c9a84c';
+  const GREEN = '#2d6a4f';
+
+  const avgLat = allPoints.reduce((s,p) => s + p.lat, 0) / allPoints.length;
+  const avgLng = allPoints.reduce((s,p) => s + p.lng, 0) / allPoints.length;
+
+  const map = new google.maps.Map(el, {
+    center: {lat: avgLat, lng: avgLng},
+    zoom: 11,
+    mapTypeId: 'roadmap',
+    zoomControl: true,
+    streetViewControl: false,
+    mapTypeControl: false,
+    fullscreenControl: true,
+    styles: [
+      {featureType:'poi',elementType:'labels',stylers:[{visibility:'off'}]},
+      {featureType:'transit',stylers:[{visibility:'off'}]},
+    ]
   });
 
-  // Draw route — try OSRM for real road path, fallback to straight lines
-  const coords = allPoints.map(p => `${p.lon},${p.lat}`).join(';');
-  let routeDrawn = false;
-
-  try {
-    const url = `http://router.project-osrm.org/route/v1/driving/${coords}?overview=full&geometries=geojson`;
-    const resp = await fetch(url, {signal: AbortSignal.timeout(6000)});
-    const data = await resp.json();
-    if (data.code === 'Ok') {
-      const geojson = data.routes[0].geometry;
-      L.geoJSON(geojson, {
-        style: {color: BRAND, weight: 3.5, opacity: .85}
-      }).addTo(map);
-      routeDrawn = true;
-    }
-  } catch(e) { /* OSRM unavailable — fall through to straight lines */ }
-
-  if (!routeDrawn) {
-    // Fallback: straight dashed lines between stops
-    const latlngs = allPoints.map(p => [p.lat, p.lon]);
-    L.polyline(latlngs, {
-      color: BRAND, weight: 2.5, opacity: .7,
-      dashArray: '6 5'
-    }).addTo(map);
+  function makeIcon(label, bg, fg, size) {
+    return {
+      url: `data:image/svg+xml;charset=UTF-8,${encodeURIComponent(
+        `<svg xmlns="http://www.w3.org/2000/svg" width="${size}" height="${size}">
+          <circle cx="${size/2}" cy="${size/2}" r="${size/2-1}" fill="${bg}" stroke="white" stroke-width="2"/>
+          <text x="${size/2}" y="${size/2+4}" text-anchor="middle" font-size="${size<=30?11:13}"
+            font-weight="700" fill="${fg}" font-family="Arial">${label}</text>
+        </svg>`
+      )}`,
+      scaledSize: new google.maps.Size(size, size),
+      anchor: new google.maps.Point(size/2, size/2),
+    };
   }
 
-  // Fit map to show all markers
-  const bounds = L.latLngBounds(allPoints.map(p => [p.lat, p.lon]));
-  map.fitBounds(bounds, {padding: [24, 24]});
-  // Force Leaflet to recalculate size after accordion animation
-  setTimeout(() => map.invalidateSize(), 150);
+  const infoWindow = new google.maps.InfoWindow();
+
+  allPoints.forEach((pt, i) => {
+    let icon, content;
+    if (pt.type === 'start') {
+      icon    = makeIcon('▶', BRAND, '#fff', 32);
+      content = `<strong>Start</strong><br>${vehicle.start_address}`;
+    } else if (pt.type === 'camp') {
+      icon    = makeIcon('⛳', GREEN, '#fff', 32);
+      content = `<strong>Camp</strong><br>${campAddr}`;
+    } else {
+      icon    = makeIcon(pt.label, GOLD, '#1a1018', 28);
+      content = `<strong>Stop ${pt.label}</strong><br>${pt.address}<br><em>${pt.riders}</em>`;
+    }
+    const marker = new google.maps.Marker({position: {lat: pt.lat, lng: pt.lng}, map, icon});
+    marker.addListener('click', () => {
+      infoWindow.setContent(content);
+      infoWindow.open(map, marker);
+    });
+  });
+
+  // Draw route with Google Directions Service
+  const directionsService  = new google.maps.DirectionsService();
+  const directionsRenderer = new google.maps.DirectionsRenderer({
+    map,
+    suppressMarkers: true,
+    polylineOptions: {strokeColor: BRAND, strokeWeight: 4, strokeOpacity: .85}
+  });
+
+  const waypoints = allPoints.slice(1, -1).map(p => ({
+    location: new google.maps.LatLng(p.lat, p.lng),
+    stopover: true,
+  }));
+
+  // Google Directions allows max 25 waypoints — if more, draw polyline fallback
+  const MAX_WP = 23;
+  const waypointsToUse = waypoints.length <= MAX_WP ? waypoints : waypoints.filter((_,i) => i % Math.ceil(waypoints.length/MAX_WP) === 0);
+
+  directionsService.route({
+    origin:      new google.maps.LatLng(allPoints[0].lat, allPoints[0].lng),
+    destination: new google.maps.LatLng(allPoints[allPoints.length-1].lat, allPoints[allPoints.length-1].lng),
+    waypoints:   waypointsToUse,
+    travelMode:  google.maps.TravelMode.DRIVING,
+    optimizeWaypoints: false,
+  }, (result, status) => {
+    if (status === 'OK') {
+      directionsRenderer.setDirections(result);
+    } else {
+      // Fallback polyline
+      new google.maps.Polyline({
+        path:          allPoints.map(p => ({lat: p.lat, lng: p.lng})),
+        map,
+        strokeColor:   BRAND,
+        strokeWeight:  3,
+        strokeOpacity: .7,
+        icons: [{icon:{path:'M 0,-1 0,1',strokeOpacity:1,scale:3},offset:'0',repeat:'12px'}],
+      });
+    }
+    const bounds = new google.maps.LatLngBounds();
+    allPoints.forEach(p => bounds.extend({lat: p.lat, lng: p.lng}));
+    map.fitBounds(bounds, {top:30, right:30, bottom:30, left:30});
+  });
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────────
