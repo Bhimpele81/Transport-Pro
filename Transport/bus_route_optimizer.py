@@ -171,6 +171,23 @@ def _load_json(path: str) -> dict:
     return {}
 
 
+def clear_bad_geocache() -> int:
+    """
+    Remove geocache entries that have coordinates outside Pennsylvania.
+    These are bad Nominatim results that caused clustering failures.
+    Returns the number of entries removed.
+    Call this if you see geographically wrong routing results.
+    """
+    cache = _load_json(GEOCACHE_FILE)
+    bad_keys = [k for k, v in cache.items()
+                if not _in_pa(v[0], v[1])]
+    for k in bad_keys:
+        del cache[k]
+    if bad_keys:
+        _save_json(GEOCACHE_FILE, cache)
+    return len(bad_keys)
+
+
 def _save_json(path: str, data: dict) -> None:
     try:
         with open(path, "w") as f:
@@ -237,31 +254,88 @@ def route_leg_times(coord_seq: list, progress_cb=None) -> list:
 # Geocoding  (OpenStreetMap Nominatim — free, no key)
 # ─────────────────────────────────────────────────────────────────────────────
 
+# Pennsylvania geographic bounds — used to validate geocoding results
+PA_LAT = (39.7, 42.3)
+PA_LON = (-80.5, -74.7)
+
+def _in_pa(lat: float, lon: float) -> bool:
+    return PA_LAT[0] <= lat <= PA_LAT[1] and PA_LON[0] <= lon <= PA_LON[1]
+
+
 def _geocode_one(address: str, cache: dict, progress_cb=None) -> tuple:
+    """
+    Geocode one address via Nominatim with Pennsylvania bounds validation.
+    Strategy:
+      1. Query Nominatim with viewbox constrained to Pennsylvania
+      2. If result is outside PA bounds, retry with 'Pennsylvania' appended
+      3. If still outside PA, use CAMP_COORDS fallback (flagged in progress)
+    This prevents addresses like "103 Indian Lake Cir" from resolving to
+    a city in a different state.
+    """
     key = address.strip().lower()
     if key in cache:
-        return tuple(cache[key])
+        cached = tuple(cache[key])
+        # Reject cached entries that are at camp fallback coords or outside PA
+        if _in_pa(*cached) and cached != CAMP_COORDS:
+            return cached
+        # Bad cached entry — remove it and re-geocode
+        del cache[key]
 
     if progress_cb:
         progress_cb(f"  Geocoding: {address}")
 
-    try:
-        params = urllib.parse.urlencode(
-            {"q": address, "format": "json", "limit": 1, "addressdetails": 0})
-        req = urllib.request.Request(
-            f"https://nominatim.openstreetmap.org/search?{params}",
-            headers={"User-Agent": "ElbowLaneCampBusRouter/1.0"})
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            results = json.loads(resp.read().decode())
-        if results:
-            lat, lon = float(results[0]["lat"]), float(results[0]["lon"])
-            cache[key] = [lat, lon]
-            _save_json(GEOCACHE_FILE, cache)
-            time.sleep(1.1)   # Nominatim rate limit: 1 req/sec
-            return lat, lon
-    except Exception as e:
-        if progress_cb:
-            progress_cb(f"  ⚠ Geocode failed for '{address}': {e}")
+    def _query(q: str) -> tuple:
+        try:
+            params = urllib.parse.urlencode({
+                "q": q,
+                "format": "json",
+                "limit": 5,          # get multiple candidates
+                "addressdetails": 1,
+                # Soft-bias toward Pennsylvania bounding box
+                "viewbox": "-80.5,39.7,-74.7,42.3",
+                "bounded": 0,        # bounded=0 allows results outside viewbox too
+            })
+            req = urllib.request.Request(
+                f"https://nominatim.openstreetmap.org/search?{params}",
+                headers={"User-Agent": "ElbowLaneCampBusRouter/1.0"})
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                results = json.loads(resp.read().decode())
+            time.sleep(1.1)   # Nominatim rate limit
+
+            # Pick first result that's within Pennsylvania
+            for r in results:
+                lat, lon = float(r["lat"]), float(r["lon"])
+                if _in_pa(lat, lon):
+                    return lat, lon
+            # No PA result found
+            return None
+        except Exception as e:
+            if progress_cb:
+                progress_cb(f"  ⚠ Geocode error for '{q}': {e}")
+            return None
+
+    # Pass 1: try as-is
+    result = _query(address)
+
+    # Pass 2: append Pennsylvania if pass 1 failed or returned outside PA
+    if result is None and "pennsylvania" not in address.lower() and "pa" not in address.lower().split(",")[-1]:
+        result = _query(address + ", Pennsylvania")
+
+    # Pass 3: try with just street + city + PA (strip zip extensions)
+    if result is None:
+        parts = [p.strip() for p in address.split(",")]
+        if len(parts) >= 3:
+            simplified = f"{parts[0]}, {parts[1]}, Pennsylvania"
+            result = _query(simplified)
+
+    if result is not None:
+        lat, lon = result
+        cache[key] = [lat, lon]
+        _save_json(GEOCACHE_FILE, cache)
+        return lat, lon
+
+    if progress_cb:
+        progress_cb(f"  ⚠ Could not geocode '{address}' within Pennsylvania — using camp coords as fallback")
 
     return CAMP_COORDS
 
@@ -269,15 +343,57 @@ def _geocode_one(address: str, cache: dict, progress_cb=None) -> tuple:
 def geocode_all_addresses(addresses: list, progress_cb=None) -> dict:
     """
     Geocode a list of addresses → {address: (lat, lon)}.
-    Cached to geocache.json — only new addresses are queried.
-    First run: ~1 second per new address (Nominatim rate limit).
-    Subsequent runs: instant from cache.
+
+    Fully self-healing — no manual cache management needed:
+    • Addresses already geocoded correctly are returned instantly from cache
+    • Any cached address with coordinates outside Pennsylvania is automatically
+      detected, removed from cache, and re-geocoded correctly
+    • Route-time cache entries tied to bad coordinates are also cleared
+    • First run: ~1 second per new address (Nominatim rate limit)
+    • Subsequent runs with same addresses: instant
     """
     cache = _load_json(GEOCACHE_FILE)
-    new_count = sum(1 for a in addresses if a.strip().lower() not in cache)
+
+    # Find addresses that need (re)geocoding — either not cached or
+    # cached with bad coordinates (outside PA or stuck at camp fallback)
+    def needs_geocode(a: str) -> bool:
+        key = a.strip().lower()
+        if key not in cache:
+            return True
+        cached = tuple(cache[key])
+        return cached == CAMP_COORDS or not _in_pa(*cached)
+
+    # Identify addresses with bad cached coords so we can also
+    # wipe their stale route-time cache entries
+    bad_addresses = [a for a in addresses if needs_geocode(a)
+                     and a.strip().lower() in cache]
+
+    if bad_addresses:
+        # Remove stale route-cache entries for these addresses
+        rcache = _load_json(ROUTECACHE_FILE)
+        removed_routes = 0
+        for addr in bad_addresses:
+            old_key = cache.get(addr.strip().lower())
+            if old_key:
+                old_lat, old_lon = old_key[0], old_key[1]
+                bad_coord_prefix = f"{old_lat:.5f},{old_lon:.5f}"
+                stale = [k for k in rcache if bad_coord_prefix in k]
+                for k in stale:
+                    del rcache[k]
+                    removed_routes += 1
+        if removed_routes:
+            _save_json(ROUTECACHE_FILE, rcache)
+            if progress_cb:
+                progress_cb(f"  Cleared {removed_routes} stale route-time entries "
+                            f"for re-geocoded addresses")
+
+    new_count = sum(1 for a in addresses if needs_geocode(a))
     if new_count and progress_cb:
-        progress_cb(f"Geocoding {new_count} new addresses via OpenStreetMap "
-                    f"(~{new_count}s)...")
+        progress_cb(f"Geocoding {new_count} address(es) via OpenStreetMap "
+                    f"(validating Pennsylvania bounds)...")
+    elif progress_cb:
+        progress_cb(f"All {len(addresses)} addresses loaded from cache")
+
     return {a: _geocode_one(a, cache, progress_cb) for a in addresses}
 
 
