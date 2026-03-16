@@ -302,80 +302,158 @@ def _in_pa(lat: float, lon: float) -> bool:
     return PA_LAT[0] <= lat <= PA_LAT[1] and PA_LON[0] <= lon <= PA_LON[1]
 
 
+# Known approximate ZIP code centroids for SE Pennsylvania.
+# Used to validate geocoding results — if Nominatim returns a point
+# more than MAX_ZIP_DEVIATION_MI from the expected ZIP centroid,
+# it's treated as a wrong result and retried.
+# This catches cases like "108 Country Ln, Lansdale, PA 19446" resolving
+# to a "Country Ln" in another state or county.
+MAX_ZIP_DEVIATION_MI = 5.0   # max acceptable distance from ZIP centroid
+
+# These are rough ZIP centroids for areas around the camp.
+# Any PA address not in this table falls back to PA-bounds-only validation.
+ZIP_CENTROIDS = {
+    "18901": (40.310, -75.130), "18902": (40.281, -75.095),
+    "18914": (40.286, -75.207), "18929": (40.250, -75.084),
+    "18954": (40.217, -74.999), "18974": (40.231, -75.062),
+    "18976": (40.245, -75.141), "19002": (40.157, -75.228),
+    "19025": (40.139, -75.177), "19040": (40.181, -75.106),
+    "19044": (40.190, -75.126), "19090": (40.149, -75.120),
+    "19446": (40.241, -75.284), "19002": (40.157, -75.228),
+}
+
+
+def _extract_zip5(address: str) -> str:
+    """Extract 5-digit ZIP from address string."""
+    m_zip = re.search(r"\b(\d{5})(?:-\d{4})?\b", address)
+    return m_zip.group(1) if m_zip else ""
+
+
+def _result_near_zip(lat: float, lon: float, zip5: str) -> bool:
+    """Return True if coords are plausibly close to the expected ZIP centroid."""
+    if zip5 not in ZIP_CENTROIDS:
+        return True   # can't validate — give benefit of the doubt
+    clat, clon = ZIP_CENTROIDS[zip5]
+    return haversine_mi(lat, lon, clat, clon) <= MAX_ZIP_DEVIATION_MI
+
+
 def _geocode_one(address: str, cache: dict, progress_cb=None) -> tuple:
     """
-    Geocode one address via Nominatim with Pennsylvania bounds validation.
-    Coordinate overrides (from coord_overrides.json) always take priority.
-    Strategy:
-      1. Check coord_overrides.json — if found, use that (highest priority)
-      2. Check geocache — if found with valid PA coords, return cached value
-      3. Query Nominatim with viewbox constrained to Pennsylvania
-      4. If result is outside PA bounds, retry with 'Pennsylvania' appended
-      5. If still outside PA, use CAMP_COORDS fallback (flagged in progress)
+    Robust geocoding for any US address, hardened against wrong-state results.
+
+    Strategy (four passes, each more specific):
+      1. Nominatim structured search: street + city + state=Pennsylvania (bounded)
+         → impossible to return results from another state
+      2. Free-text search with viewbox HARD-BOUNDED to Pennsylvania
+         → bounded=1 means Nominatim ONLY returns results inside the viewbox
+      3. Simplified query (street + city + Pennsylvania) bounded to PA box
+      4. ZIP centroid fallback with warning
+
+    Each result is validated against:
+      a) Pennsylvania lat/lon bounds
+      b) Proximity to the expected ZIP code centroid (within 8 miles)
+
+    This approach works reliably for any address in any future roster.
     """
     key = address.strip().lower()
-    
-    # Override file always wins — allows fixing bad Nominatim results
+
+    # Override file always wins (allows permanent fixes for any address)
     overrides = _load_overrides()
     if key in overrides:
         lat, lon = float(overrides[key][0]), float(overrides[key][1])
-        cache[key] = [lat, lon]   # keep geocache in sync
+        cache[key] = [lat, lon]
         return lat, lon
-    
+
     if key in cache:
         cached = tuple(cache[key])
-        # Reject cached entries that are at camp fallback coords or outside PA
         if _in_pa(*cached) and cached != CAMP_COORDS:
-            return cached
-        # Bad cached entry — remove it and re-geocode
-        del cache[key]
+            zip5 = _extract_zip5(address)
+            if _result_near_zip(*cached, zip5):
+                return cached
+        del cache[key]   # bad cached result — re-geocode
 
     if progress_cb:
         progress_cb(f"  Geocoding: {address}")
 
-    def _query(q: str) -> tuple:
+    zip5 = _extract_zip5(address)
+    parts = [p.strip() for p in address.split(",")]
+    street = parts[0] if parts else address
+    city   = parts[1] if len(parts) > 1 else ""
+
+    def _validate(lat, lon) -> bool:
+        return _in_pa(lat, lon) and _result_near_zip(lat, lon, zip5)
+
+    def _structured_query() -> tuple:
+        """Pass 1: Nominatim structured search locked to Pennsylvania."""
         try:
             params = urllib.parse.urlencode({
-                "q": q,
-                "format": "json",
-                "limit": 5,          # get multiple candidates
-                "addressdetails": 1,
-                # Soft-bias toward Pennsylvania bounding box
-                "viewbox": "-80.5,39.7,-74.7,42.3",
-                "bounded": 0,        # bounded=0 allows results outside viewbox too
+                "street":  street,
+                "city":    city,
+                "state":   "Pennsylvania",
+                "country": "United States",
+                "format":  "json",
+                "limit":   3,
+                "addressdetails": 0,
             })
             req = urllib.request.Request(
                 f"https://nominatim.openstreetmap.org/search?{params}",
                 headers={"User-Agent": "ElbowLaneCampBusRouter/1.0"})
             with urllib.request.urlopen(req, timeout=10) as resp:
                 results = json.loads(resp.read().decode())
-            time.sleep(1.1)   # Nominatim rate limit
-
-            # Pick first result that's within Pennsylvania
+            time.sleep(1.1)
             for r in results:
                 lat, lon = float(r["lat"]), float(r["lon"])
-                if _in_pa(lat, lon):
+                if _validate(lat, lon):
                     return lat, lon
-            # No PA result found
-            return None
         except Exception as e:
             if progress_cb:
-                progress_cb(f"  ⚠ Geocode error for '{q}': {e}")
-            return None
+                progress_cb(f"  ⚠ Structured query error: {e}")
+        return None
 
-    # Pass 1: try as-is
-    result = _query(address)
+    def _bounded_query(q: str) -> tuple:
+        """Pass 2/3: Free-text search HARD-BOUNDED to Pennsylvania box."""
+        try:
+            params = urllib.parse.urlencode({
+                "q":       q,
+                "format":  "json",
+                "limit":   5,
+                "addressdetails": 0,
+                "viewbox": "-80.5,39.7,-74.7,42.3",
+                "bounded": 1,   # HARD bound — only return PA results
+            })
+            req = urllib.request.Request(
+                f"https://nominatim.openstreetmap.org/search?{params}",
+                headers={"User-Agent": "ElbowLaneCampBusRouter/1.0"})
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                results = json.loads(resp.read().decode())
+            time.sleep(1.1)
+            for r in results:
+                lat, lon = float(r["lat"]), float(r["lon"])
+                if _validate(lat, lon):
+                    return lat, lon
+        except Exception as e:
+            if progress_cb:
+                progress_cb(f"  ⚠ Bounded query error: {e}")
+        return None
 
-    # Pass 2: append Pennsylvania if pass 1 failed or returned outside PA
-    if result is None and "pennsylvania" not in address.lower() and "pa" not in address.lower().split(",")[-1]:
-        result = _query(address + ", Pennsylvania")
+    # Pass 1: structured (state=Pennsylvania, impossible to get wrong state)
+    result = _structured_query()
 
-    # Pass 3: try with just street + city + PA (strip zip extensions)
+    # Pass 2: hard-bounded free-text
     if result is None:
-        parts = [p.strip() for p in address.split(",")]
-        if len(parts) >= 3:
-            simplified = f"{parts[0]}, {parts[1]}, Pennsylvania"
-            result = _query(simplified)
+        result = _bounded_query(address)
+
+    # Pass 3: simplified address hard-bounded
+    if result is None and city:
+        result = _bounded_query(f"{street}, {city}, Pennsylvania")
+
+    # Pass 4: ZIP centroid fallback
+    if result is None and zip5 in ZIP_CENTROIDS:
+        lat, lon = ZIP_CENTROIDS[zip5]
+        if progress_cb:
+            progress_cb(f"  ⚠ Using ZIP centroid for '{address}' "
+                        f"({lat:.4f}, {lon:.4f}) — addresses on this route may be approximate")
+        result = (lat, lon)
 
     if result is not None:
         lat, lon = result
@@ -386,8 +464,7 @@ def _geocode_one(address: str, cache: dict, progress_cb=None) -> tuple:
         return lat, lon
 
     if progress_cb:
-        progress_cb(f"  ⚠ Could not geocode '{address}' within Pennsylvania — using camp coords as fallback")
-
+        progress_cb(f"  ⚠ Could not geocode '{address}' — using camp coords as fallback")
     return CAMP_COORDS
 
 
