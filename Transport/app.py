@@ -415,6 +415,10 @@ label.lbl{display:block;font-size:.75rem;font-weight:600;color:var(--brand-dark)
     </button>
 
     <div class="fleet-summary" id="fleet-summary"></div>
+    <div id="capacity-warning" style="display:none;margin-top:.75rem;background:#fff3cd;border:1px solid #f0c060;border-radius:8px;padding:.75rem 1rem;font-size:.84rem;color:#7a4f00;display:flex;align-items:center;gap:.6rem">
+      <span style="font-size:1.1rem">⚠️</span>
+      <span id="capacity-warning-msg"></span>
+    </div>
   </div>
 
   <!-- Run -->
@@ -591,13 +595,31 @@ function updateFleetSummary() {
   const summary = document.getElementById('fleet-summary');
   const total = fleet.reduce((s, v) => s + v.capacity, 0);
   const filled = fleet.filter(v => v.address.trim()).length;
+  const seatsOk = studentCount === 0 || total >= studentCount;
   summary.innerHTML = `
     <span class="fleet-chip">🚌 ${fleet.length} vehicles</span>
-    <span class="fleet-chip">💺 ${total} total seats</span>
+    <span class="fleet-chip" style="${!seatsOk ? 'background:#fde8e8;border-color:#e07070;color:#7a1f1f' : ''}">
+      💺 ${total} total seats${studentCount > 0 ? ' / ' + studentCount + ' needed' : ''}
+    </span>
     <span class="fleet-chip" style="${filled < fleet.length ? 'background:#fff3cd;border-color:#f0c060' : ''}">
       📍 ${filled}/${fleet.length} addresses entered
     </span>
   `;
+  checkCapacity();
+}
+
+function checkCapacity() {
+  const total = fleet.reduce((s, v) => s + v.capacity, 0);
+  const warning = document.getElementById('capacity-warning');
+  const msg = document.getElementById('capacity-warning-msg');
+  if (studentCount > 0 && total < studentCount) {
+    const needed = studentCount - total;
+    msg.textContent = `Not enough seats — you have ${total} seats for ${studentCount} students. Add ${needed} more seat${needed !== 1 ? 's' : ''} by increasing vehicle capacities or adding another vehicle.`;
+    warning.style.display = 'flex';
+  } else {
+    warning.style.display = 'none';
+  }
+  updateRunBtn();
 }
 
 // ── Fleet → text format for backend ───────────────────────────────────────
@@ -612,13 +634,17 @@ const dropZone   = document.getElementById('drop-zone');
 const csvInput   = document.getElementById('csv-file');
 const fileChosen = document.getElementById('file-chosen');
 
+let studentCount = 0;
+
 function setFile(file) {
   csvFile = file;
   document.getElementById('file-name').textContent = file.name;
   const reader = new FileReader();
   reader.onload = e => {
     const lines = e.target.result.split('\n').filter(l => l.trim()).length;
-    document.getElementById('file-rows').textContent = `· ${lines - 1} students`;
+    studentCount = lines - 1;
+    document.getElementById('file-rows').textContent = `· ${studentCount} students`;
+    checkCapacity();
   };
   reader.readAsText(file);
   fileChosen.classList.add('visible');
@@ -636,8 +662,10 @@ dropZone.addEventListener('drop', e => {
 });
 document.getElementById('remove-file').addEventListener('click', e => {
   e.stopPropagation(); csvFile = null; csvInput.value = '';
+  studentCount = 0;
   fileChosen.classList.remove('visible');
   dropZone.querySelector('.drop-icon').textContent = '📋';
+  document.getElementById('capacity-warning').style.display = 'none';
   updateRunBtn();
 });
 
@@ -645,7 +673,16 @@ document.getElementById('remove-file').addEventListener('click', e => {
 function updateRunBtn() {
   const hasCSV = !!csvFile;
   const hasAddresses = fleet.some(v => v.address.trim().length > 5);
-  document.getElementById('run-btn').disabled = !(hasCSV && hasAddresses);
+  const totalSeats = fleet.reduce((s, v) => s + v.capacity, 0);
+  const hasEnoughSeats = studentCount === 0 || totalSeats >= studentCount;
+  const btn = document.getElementById('run-btn');
+  const label = document.getElementById('run-label');
+  btn.disabled = !(hasCSV && hasAddresses && hasEnoughSeats);
+  if (hasCSV && hasAddresses && !hasEnoughSeats) {
+    label.textContent = `Not enough seats (${totalSeats} / ${studentCount} needed)`;
+  } else {
+    label.textContent = 'Generate Route Plan';
+  }
 }
 
 // ── Run ────────────────────────────────────────────────────────────────────
