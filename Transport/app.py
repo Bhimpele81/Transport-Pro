@@ -128,7 +128,17 @@ def api_run():
     try:
         students = parse_students_csv(csv_text)
         if not students:
-            return jsonify({"error": "No students found in CSV. Check column names."}), 400
+            # Check if it's a missing-header issue vs empty file
+            first_line = csv_text.strip().split("\n")[0].lower() if csv_text.strip() else ""
+            has_name   = "name" in first_line
+            has_addr   = "address" in first_line or "street" in first_line
+            has_zip    = "zip" in first_line or "postal" in first_line
+            if not (has_name and has_addr):
+                return jsonify({"error":
+                    "Could not find required columns. Make sure your CSV has a header row "
+                    "with column names like: Last name, First name, Address, City, Zip. "
+                    "The first row must contain column headers, not student data."}), 400
+            return jsonify({"error": "No students found in CSV. The file may be empty."}), 400
     except Exception as e:
         return jsonify({"error": f"CSV parse error: {e}"}), 400
 
