@@ -359,7 +359,26 @@ label.lbl{display:block;font-size:.75rem;font-weight:600;color:var(--brand-dark)
 .summary-totals td{color:#fff!important;font-weight:700;border-bottom:none!important}
 
 /* responsive */
-@media(max-width:640px){.fleet-row{grid-template-columns:1fr 1fr;grid-template-rows:auto auto}.fleet-col-label{display:none}.veh-stats{display:none}.tab span:not(.tab-badge){display:none}}
+@media(max-width:640px){
+  .fleet-row{grid-template-columns:1fr 1fr;grid-template-rows:auto auto}
+  .fleet-col-label{display:none}
+  .veh-stats{display:none}
+  .tab span:not(.tab-badge){display:none}
+  header{padding:0 1rem;gap:.75rem;height:64px}
+  .h-logo{width:46px;height:46px}
+  .h-title{font-size:1rem}
+  .h-sub{display:none}
+  .h-badge{display:none}
+  .container{padding:1rem .75rem 3rem}
+  .card{padding:1.1rem 1rem}
+  .trip-settings-grid{grid-template-columns:1fr !important;gap:.75rem}
+  .trip-btn{padding:.6rem .9rem;font-size:.75rem}
+  .run-btn{font-size:.95rem}
+  .summary-table{font-size:.72rem}
+  .summary-table th,.summary-table td{padding:.4rem .5rem}
+  .veh-header{flex-wrap:wrap;gap:.5rem}
+  .veh-corridor{display:none}
+}
 </style>
 </head>
 <body>
@@ -393,13 +412,13 @@ label.lbl{display:block;font-size:.75rem;font-weight:600;color:var(--brand-dark)
       </div>
     </div>
 
-    <div style="display:grid;grid-template-columns:1fr auto;gap:1rem;align-items:start">
+    <div class="trip-settings-grid" style="display:grid;grid-template-columns:1fr auto;gap:1rem;align-items:start">
       <div>
         <label class="lbl" for="camp-address">Camp Address</label>
         <input type="text" id="camp-address"
                value="828 Elbow Lane, Warrington, PA 18976"
                placeholder="828 Elbow Lane, Warrington, PA 18976"
-               style="width:100%;padding:.6rem .85rem;border:1.5px solid var(--border);border-radius:8px;font-family:'DM Sans',sans-serif;font-size:.88rem;color:var(--ink);background:var(--mist);transition:border-color .15s"
+               style="width:100%;padding:.6rem .85rem;border:1.5px solid var(--border);border-radius:8px;font-family:'DM Sans',sans-serif;font-size:.85rem;color:var(--ink);background:var(--mist);transition:border-color .15s;box-sizing:border-box"
                onfocus="this.style.borderColor='var(--brand-mid)';this.style.background='#fff'"
                onblur="this.style.borderColor='var(--border)';this.style.background='var(--mist)'">
         <div style="font-size:.72rem;color:#aaa;margin-top:.35rem">
