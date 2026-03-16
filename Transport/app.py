@@ -183,6 +183,8 @@ HTML = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
+<meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+<meta http-equiv="Pragma" content="no-cache">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Elbow Lane — Bus Route Optimizer</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -207,7 +209,7 @@ body{font-family:'DM Sans',sans-serif;background:var(--mist);color:var(--ink);mi
 
 /* header */
 header{background:var(--brand);color:#fff;padding:0 2rem;display:flex;align-items:center;gap:1.25rem;height:80px;box-shadow:0 2px 16px rgba(109,31,47,.35);position:sticky;top:0;z-index:200}
-.h-logo{width:60px;height:60px;flex-shrink:0;object-fit:contain}
+.h-logo{width:58px;height:58px;flex-shrink:0;object-fit:cover;object-position:center center;display:block}
 .h-title{font-family:'Oswald',sans-serif;font-size:1.3rem;font-weight:700;letter-spacing:.06em;text-transform:uppercase}
 .h-sub{font-size:.72rem;opacity:.75;font-weight:400;margin-top:2px;letter-spacing:.08em;text-transform:uppercase}
 .h-badge{margin-left:auto;background:rgba(255,255,255,.15);border:1px solid rgba(255,255,255,.3);color:#fff;font-size:.68rem;font-family:'Oswald',sans-serif;font-weight:500;letter-spacing:.12em;text-transform:uppercase;padding:.35rem .9rem;border-radius:20px;white-space:nowrap}
