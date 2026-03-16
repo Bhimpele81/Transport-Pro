@@ -39,6 +39,8 @@ def vehicles_to_json(vehicles: list) -> list:
             "corridor":        v.corridor,
             "start_lat":       v.start_lat,
             "start_lon":       v.start_lon,
+            "camp_lat":        getattr(v, "camp_lat", 40.2454),
+            "camp_lon":        getattr(v, "camp_lon", -75.1407),
             "stops": [
                 {
                     "stop_num":    i + 1,
@@ -1045,16 +1047,17 @@ function initVehicleMap(mapId, vehicle) {
   const campAddr = document.getElementById('camp-address').value.trim() || '828 Elbow Lane, Warrington, PA 18976';
   const allPoints = [];
 
-  if (vehicle.start_lat && vehicle.start_lon) {
-    allPoints.push({lat: vehicle.start_lat, lng: vehicle.start_lon, type: 'start'});
-  }
+  // Map shows stop 1 → stop N → camp only (no garage-to-first-stop leg)
   vehicle.stops.forEach((s, i) => {
     if (s.lat && s.lon && (s.lat !== 0 || s.lon !== 0)) {
       allPoints.push({lat: s.lat, lng: s.lon, label: String(i+1), type: 'stop',
                       riders: s.rider_names, address: s.address.split(',')[0]});
     }
   });
-  allPoints.push({lat: 40.2454, lng: -75.1407, type: 'camp'});
+  // Camp destination
+  const campLat = vehicle.camp_lat || 40.2454;
+  const campLng = vehicle.camp_lon || -75.1407;
+  allPoints.push({lat: campLat, lng: campLng, type: 'camp'});
 
   if (allPoints.length < 2) {
     el.innerHTML = '<div class="map-loading">No coordinates available</div>';
