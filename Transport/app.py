@@ -206,14 +206,14 @@ HTML = r"""<!DOCTYPE html>
 body{font-family:'DM Sans',sans-serif;background:var(--mist);color:var(--ink);min-height:100vh}
 
 /* header */
-header{background:var(--brand);color:#fff;padding:0 2rem;display:flex;align-items:center;gap:1.25rem;height:76px;box-shadow:0 2px 16px rgba(109,31,47,.35);position:sticky;top:0;z-index:200}
-.h-logo{width:56px;height:56px;border-radius:50%;object-fit:cover;object-position:center;flex-shrink:0;box-shadow:0 2px 8px rgba(0,0,0,.3)}
+header{background:var(--brand);color:#fff;padding:0 2rem;display:flex;align-items:center;gap:1.25rem;height:80px;box-shadow:0 2px 16px rgba(109,31,47,.35);position:sticky;top:0;z-index:200}
+.h-logo{width:60px;height:60px;border-radius:50%;object-fit:contain;flex-shrink:0;background:var(--brand-dark);padding:2px}
 .h-title{font-family:'Playfair Display',serif;font-size:1.3rem;font-weight:700}
 .h-sub{font-size:.78rem;opacity:.7;font-weight:300;margin-top:1px}
 .h-badge{margin-left:auto;background:rgba(255,255,255,.15);border:1px solid rgba(255,255,255,.3);color:#fff;font-size:.7rem;font-weight:600;letter-spacing:.08em;text-transform:uppercase;padding:.3rem .8rem;border-radius:20px;white-space:nowrap}
 
 /* tabs */
-.tab-bar{display:flex;background:#fff;border-bottom:2px solid var(--border);position:sticky;top:76px;z-index:100}
+.tab-bar{display:flex;background:#fff;border-bottom:2px solid var(--border);position:sticky;top:80px;z-index:100}
 .tab{padding:.85rem 1.75rem;font-size:.88rem;font-weight:600;color:#999;cursor:pointer;border-bottom:3px solid transparent;margin-bottom:-2px;transition:color .15s,border-color .15s;white-space:nowrap;display:flex;align-items:center;gap:.5rem}
 .tab:hover{color:var(--brand-mid)}
 .tab.active{color:var(--brand);border-bottom-color:var(--brand)}
