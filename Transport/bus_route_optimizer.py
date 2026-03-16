@@ -599,11 +599,13 @@ def parse_students_csv(csv_text: str) -> list:
         idx_key = next((k for k in row if k in ("", "idx", "#")), "")
         try:    idx = int(row.get(idx_key, 0))
         except: idx = 0
-        last  = row.get("Last name",               row.get("last_name",  ""))
-        first = row.get("First name",              row.get("first_name", ""))
-        addr  = row.get("Primary family address 1", row.get("address",  ""))
-        city  = row.get("Primary family city",     row.get("city",       ""))
-        zip_  = row.get("Primary family zip",      row.get("zip",        ""))
+        last  = (row.get("Last name")   or row.get("last_name")  or row.get("Last Name")  or "")
+        first = (row.get("First name")  or row.get("first_name") or row.get("First Name") or "")
+        addr  = (row.get("Primary family address 1") or row.get("Address") or
+                 row.get("address") or row.get("Street") or "")
+        city  = (row.get("Primary family city") or row.get("City") or row.get("city") or "")
+        zip_  = (row.get("Primary family zip")  or row.get("Zip")  or row.get("zip")
+                 or row.get("ZIP") or row.get("Postal Code") or "")
         if last and addr:
             students.append(Student(idx, last, first, addr, city, zip_))
     return students
@@ -784,7 +786,14 @@ def cluster_and_route(students: list, vehicles: list,
         remaining = veh_objects[vi].capacity - counts[vi]
         if remaining < cl_size(cl): return float("inf")
         clat, clon = centroid(cl)
-        return haversine_mi(clat, clon, veh_objects[vi].start_lat, veh_objects[vi].start_lon)
+        geo = haversine_mi(clat, clon, veh_objects[vi].start_lat, veh_objects[vi].start_lon)
+        # Bonus for filling small vehicles — reduces their likelihood of ending up empty
+        cap = veh_objects[vi].capacity
+        small_bonus = 3.0 if cap <= 6 else (1.5 if cap <= 9 else 0.0)
+        fill_ratio = counts[vi] / cap if cap else 0
+        # Prefer vehicles that are partially filled (building on existing load)
+        fill_bonus = fill_ratio * 2.0
+        return geo - small_bonus - fill_bonus
 
     leftover = []
     for cl in assignable:
@@ -818,9 +827,18 @@ def cluster_and_route(students: list, vehicles: list,
         changed, passes = False, passes + 1
 
         # Sort under-filled: emptiest first (empty buses eliminated first)
+        # Small vehicles (capacity ≤ 6) use a lower threshold since they're
+        # harder to fill precisely with geographic constraints
+        def effective_threshold(vi):
+            cap = veh_objects[vi].capacity
+            if cap <= 6:  return 0.50   # 50% min for small vans
+            if cap <= 9:  return 0.60   # 60% min for medium vans
+            return MIN_UTIL              # 75% for full-size vans
+
         under = sorted(
             [vi for vi in range(len(veh_objects))
-             if counts[vi] / veh_objects[vi].capacity < MIN_UTIL],
+             if counts[vi] > 0 and
+                counts[vi] / veh_objects[vi].capacity < effective_threshold(vi)],
             key=lambda vi: counts[vi])
 
         if not under: break
@@ -917,7 +935,9 @@ def cluster_and_route(students: list, vehicles: list,
         if moved: changed = True
         # If nothing moved: geographic constraint — accept and flag as warning
 
-    # ── 5c. Prune empty vehicles ───────────────────────────────────────────
+    # ── 5c. Prune truly empty vehicles (0 riders) ────────────────────────
+    # Vehicles that have riders but are under threshold are kept and flagged.
+    # Only vehicles with zero riders are removed from the output.
     active = [vi for vi in range(len(veh_objects)) if counts[vi] > 0]
     veh_objects = [veh_objects[vi] for vi in active]
     assignments = [assignments[vi] for vi in active]
@@ -1010,8 +1030,10 @@ def cluster_and_route(students: list, vehicles: list,
         veh.total_distance = f"{round(dist, 1)} mi"
 
         # Flag under-threshold for dashboard warning
-        veh.under_threshold = (veh.rider_count / veh.capacity < MIN_UTIL
-                                if veh.capacity else False)
+        cap = veh.capacity
+        eff_threshold = 0.50 if cap <= 6 else (0.60 if cap <= 9 else MIN_UTIL)
+        veh.under_threshold = (veh.rider_count / cap < eff_threshold
+                                if cap else False)
 
     return veh_objects
 
