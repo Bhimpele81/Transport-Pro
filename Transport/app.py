@@ -701,7 +701,6 @@ function setTrip(dir) {
   }
 }
 
-let studentCount = 0;
 
 function setFile(file) {
   csvFile = file;
