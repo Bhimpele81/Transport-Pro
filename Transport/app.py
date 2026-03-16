@@ -186,7 +186,7 @@ HTML = r"""<!DOCTYPE html>
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Elbow Lane — Bus Route Optimizer</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
-<link href="https://fonts.googleapis.com/css2?family=Playfair+Display:wght@700;900&family=DM+Sans:ital,wght@0,300;0,400;0,500;0,600;1,400&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Oswald:wght@500;600;700&family=DM+Sans:ital,wght@0,300;0,400;0,500;0,600;1,400&display=swap" rel="stylesheet">
 <style>
 :root {
   --brand:      #6D1F2F;
@@ -207,14 +207,14 @@ body{font-family:'DM Sans',sans-serif;background:var(--mist);color:var(--ink);mi
 
 /* header */
 header{background:var(--brand);color:#fff;padding:0 2rem;display:flex;align-items:center;gap:1.25rem;height:80px;box-shadow:0 2px 16px rgba(109,31,47,.35);position:sticky;top:0;z-index:200}
-.h-logo{width:60px;height:60px;border-radius:50%;object-fit:contain;flex-shrink:0;background:var(--brand-dark);padding:2px}
-.h-title{font-family:'Playfair Display',serif;font-size:1.3rem;font-weight:700}
-.h-sub{font-size:.78rem;opacity:.7;font-weight:300;margin-top:1px}
-.h-badge{margin-left:auto;background:rgba(255,255,255,.15);border:1px solid rgba(255,255,255,.3);color:#fff;font-size:.7rem;font-weight:600;letter-spacing:.08em;text-transform:uppercase;padding:.3rem .8rem;border-radius:20px;white-space:nowrap}
+.h-logo{width:60px;height:60px;flex-shrink:0;object-fit:contain}
+.h-title{font-family:'Oswald',sans-serif;font-size:1.3rem;font-weight:700;letter-spacing:.06em;text-transform:uppercase}
+.h-sub{font-size:.72rem;opacity:.75;font-weight:400;margin-top:2px;letter-spacing:.08em;text-transform:uppercase}
+.h-badge{margin-left:auto;background:rgba(255,255,255,.15);border:1px solid rgba(255,255,255,.3);color:#fff;font-size:.68rem;font-family:'Oswald',sans-serif;font-weight:500;letter-spacing:.12em;text-transform:uppercase;padding:.35rem .9rem;border-radius:20px;white-space:nowrap}
 
 /* tabs */
 .tab-bar{display:flex;background:#fff;border-bottom:2px solid var(--border);position:sticky;top:80px;z-index:100}
-.tab{padding:.85rem 1.75rem;font-size:.88rem;font-weight:600;color:#999;cursor:pointer;border-bottom:3px solid transparent;margin-bottom:-2px;transition:color .15s,border-color .15s;white-space:nowrap;display:flex;align-items:center;gap:.5rem}
+.tab{padding:.85rem 1.75rem;font-size:.82rem;font-weight:500;font-family:'Oswald',sans-serif;letter-spacing:.07em;text-transform:uppercase;color:#999;cursor:pointer;border-bottom:3px solid transparent;margin-bottom:-2px;transition:color .15s,border-color .15s;white-space:nowrap;display:flex;align-items:center;gap:.5rem}
 .tab:hover{color:var(--brand-mid)}
 .tab.active{color:var(--brand);border-bottom-color:var(--brand)}
 .tab-badge{background:var(--brand);color:#fff;font-size:.65rem;font-weight:700;padding:.15rem .45rem;border-radius:10px;min-width:18px;text-align:center}
@@ -228,7 +228,7 @@ header{background:var(--brand);color:#fff;padding:0 2rem;display:flex;align-item
 .card:hover{box-shadow:0 3px 12px rgba(109,31,47,.07)}
 .card-hd{display:flex;align-items:center;gap:.7rem;margin-bottom:1.1rem}
 .card-num{width:26px;height:26px;background:var(--brand);color:#fff;border-radius:50%;font-size:.75rem;font-weight:700;display:flex;align-items:center;justify-content:center;flex-shrink:0}
-.card-title{font-family:'Playfair Display',serif;font-size:1.05rem;font-weight:700;color:var(--brand-dark)}
+.card-title{font-family:'Oswald',sans-serif;font-size:1.1rem;font-weight:600;color:var(--brand-dark);letter-spacing:.04em;text-transform:uppercase}
 .card-hint{font-size:.75rem;color:#999;margin-top:.15rem;font-weight:300}
 label.lbl{display:block;font-size:.75rem;font-weight:600;color:var(--brand-dark);letter-spacing:.04em;text-transform:uppercase;margin-bottom:.4rem}
 
@@ -258,7 +258,7 @@ label.lbl{display:block;font-size:.75rem;font-weight:600;color:var(--brand-dark)
 .fleet-chip{background:var(--brand-light);border:1px solid #d4a0aa;border-radius:20px;padding:.3rem .85rem;font-size:.75rem;font-weight:500;color:var(--brand-dark)}
 
 /* run button */
-.run-btn{width:100%;padding:.95rem 2rem;background:var(--brand);color:#fff;border:none;border-radius:var(--r);font-family:'Playfair Display',serif;font-size:1.1rem;font-weight:700;cursor:pointer;display:flex;align-items:center;justify-content:center;gap:.65rem;transition:background .18s,transform .1s,box-shadow .18s;box-shadow:0 4px 14px rgba(109,31,47,.3);margin-top:1.25rem}
+.run-btn{width:100%;padding:.95rem 2rem;background:var(--brand);color:#fff;border:none;border-radius:var(--r);font-family:'Oswald',sans-serif;font-size:1.1rem;font-weight:600;letter-spacing:.06em;text-transform:uppercase;cursor:pointer;display:flex;align-items:center;justify-content:center;gap:.65rem;transition:background .18s,transform .1s,box-shadow .18s;box-shadow:0 4px 14px rgba(109,31,47,.3);margin-top:1.25rem}
 .run-btn:hover:not(:disabled){background:var(--brand-dark);box-shadow:0 6px 20px rgba(109,31,47,.4);transform:translateY(-1px)}
 .run-btn:disabled{opacity:.55;cursor:not-allowed;transform:none;box-shadow:none}
 
@@ -293,7 +293,7 @@ label.lbl{display:block;font-size:.75rem;font-weight:600;color:var(--brand-dark)
 
 /* dashboard summary table */
 .summary-table{width:100%;border-collapse:collapse;font-size:.83rem}
-.summary-table th{background:var(--brand);color:#fff;padding:.6rem .9rem;text-align:left;font-weight:600;font-size:.75rem;letter-spacing:.05em;text-transform:uppercase}
+.summary-table th{background:var(--brand);color:#fff;padding:.6rem .9rem;text-align:left;font-family:'Oswald',sans-serif;font-weight:500;font-size:.82rem;letter-spacing:.08em;text-transform:uppercase}
 .summary-table th:first-child{border-radius:6px 0 0 0}
 .summary-table th:last-child{border-radius:0 6px 0 0}
 .summary-table td{padding:.6rem .9rem;border-bottom:1px solid var(--border);vertical-align:middle}
@@ -315,7 +315,7 @@ label.lbl{display:block;font-size:.75rem;font-weight:600;color:var(--brand-dark)
 .veh-card.warn-card{border-color:#f0c060}
 .veh-header{display:flex;align-items:center;gap:1rem;padding:.9rem 1.1rem;cursor:pointer;user-select:none}
 .veh-header:hover{background:var(--mist)}
-.veh-name{font-family:'Playfair Display',serif;font-size:1rem;font-weight:700;color:var(--brand-dark);min-width:90px}
+.veh-name{font-family:'Oswald',sans-serif;font-size:1rem;font-weight:600;color:var(--brand-dark);min-width:90px;letter-spacing:.04em;text-transform:uppercase}
 .veh-corridor{font-size:.78rem;color:#888;flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .veh-stats{display:flex;align-items:center;gap:.75rem;margin-left:auto;flex-shrink:0}
 .veh-stat{font-size:.78rem;color:#666;white-space:nowrap}
