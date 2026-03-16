@@ -1,0 +1,20 @@
+# Cache files — generated automatically at runtime, do not commit
+geocache.json
+routecache.json
+
+# Generated Excel output files
+outputs/
+*.xlsx
+
+# Uploaded CSV files
+uploads/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.env
+
+# Replit
+.replit.nix
+replit.nix
