@@ -455,7 +455,7 @@ label.lbl{display:block;font-size:.75rem;font-weight:600;color:var(--brand-dark)
       <input type="file" id="csv-file" accept=".csv">
       <div class="drop-icon">📋</div>
       <div class="drop-text"><strong>Click to choose</strong> or drag & drop your CSV file</div>
-      <div class="drop-meta">Columns needed: Last name · First name · Primary family address 1 · Primary family city · Primary family zip</div>
+      <div class="drop-meta">Required columns: Last name  |  First name  |  Address  |  City  |  Zip</div>
     </div>
     <div class="file-chosen" id="file-chosen">
       <span>✅</span>
