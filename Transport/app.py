@@ -340,7 +340,7 @@ label.lbl{display:block;font-size:.75rem;font-weight:600;color:var(--brand-dark)
 .veh-card.open .veh-chevron{transform:rotate(180deg)}
 .veh-body{display:none;padding:0 1.1rem 1.1rem;border-top:1px solid var(--border)}
 .veh-card.open .veh-body{display:block}
-.veh-map{width:100%;height:280px;border-radius:8px;margin-bottom:.9rem;border:1px solid var(--border);overflow:hidden;background:var(--mist)}
+.veh-map{width:100%;height:280px;border-radius:8px;margin-bottom:.9rem;border:1px solid var(--border);background:var(--mist);position:relative;z-index:1}
 .map-loading{display:flex;align-items:center;justify-content:center;height:100%;font-size:.82rem;color:#aaa;gap:.5rem}
 
 /* stop list */
@@ -975,7 +975,7 @@ function buildResultsTab(vehicles, jobId) {
       card.classList.toggle('open');
       if (card.classList.contains('open') && !mapInitialised) {
         mapInitialised = true;
-        setTimeout(() => initVehicleMap(mapId, v), 50);
+        setTimeout(() => initVehicleMap(mapId, v), 200);
       }
     });
 
@@ -1013,8 +1013,12 @@ async function initVehicleMap(mapId, vehicle) {
     return;
   }
 
-  // Init Leaflet map
+  // Clear loading message and ensure container is visible before init
   el.innerHTML = '';
+  el.style.display = 'block';
+  // Small delay to let CSS finish showing the accordion body
+  await new Promise(r => setTimeout(r, 100));
+  
   const map = L.map(el, {zoomControl: true, scrollWheelZoom: false});
   leafletMaps[mapId] = map;
 
@@ -1086,6 +1090,8 @@ async function initVehicleMap(mapId, vehicle) {
   // Fit map to show all markers
   const bounds = L.latLngBounds(allPoints.map(p => [p.lat, p.lon]));
   map.fitBounds(bounds, {padding: [24, 24]});
+  // Force Leaflet to recalculate size after accordion animation
+  setTimeout(() => map.invalidateSize(), 150);
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────────
