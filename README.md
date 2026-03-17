@@ -52,43 +52,6 @@ Automated, Google Maps-powered bus route optimization for day camps. Upload a st
 
 ---
 
-## Setup
-
-### 1. Prerequisites
-
-- Python 3.10+
-- A Google Maps API key with these APIs enabled:
-  - Geocoding API
-  - Directions API
-  - Maps JavaScript API
-
-### 2. Clone and install
-
-```bash
-git clone https://github.com/your-username/your-repo.git
-cd your-repo
-pip install -r requirements.txt
-```
-
-### 3. Set your Google Maps API key
-
-**On Replit:** Add a Secret named `GOOGLE_MAPS_KEY` with your API key as the value.
-
-**Locally:** Set an environment variable:
-```bash
-export GOOGLE_MAPS_KEY=your_api_key_here
-```
-
-### 4. Run
-
-```bash
-python app.py
-```
-
-The app will be available at `http://localhost:5000`.
-
----
-
 ## How It Works
 
 ### Routing Algorithm
