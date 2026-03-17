@@ -987,7 +987,7 @@ def cluster_and_route(students: list, vehicles: list,
         # Build address-level stop objects
         addr_stop: dict = {}
         for unit in assignments[vi]:
-            rep = unit[0]; key = rep.address.lower().strip()
+            rep = unit[0]; key = rep.full_address.lower().strip()
             if key not in addr_stop:
                 addr_stop[key] = Stop(address=rep.full_address,
                                       lat=rep.lat, lon=rep.lon)
