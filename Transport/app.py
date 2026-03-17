@@ -88,10 +88,16 @@ def run_job(job_id: str, csv_text: str, vehicles_text: str,
 
         progress("✅  Excel saved")
 
+        camp_lat_val = vehicles[0].camp_lat if vehicles else CAMP_COORDS[0]
+        camp_lon_val = vehicles[0].camp_lon if vehicles else CAMP_COORDS[1]
         with jobs_lock:
-            jobs[job_id]["status"]    = "done"
-            jobs[job_id]["output_path"] = output_path
-            jobs[job_id]["route_data"]  = vehicles_to_json(vehicles)
+            jobs[job_id]["status"]        = "done"
+            jobs[job_id]["output_path"]   = output_path
+            jobs[job_id]["route_data"]    = vehicles_to_json(vehicles)
+            jobs[job_id]["camp_address"]  = camp_address
+            jobs[job_id]["trip_direction"]= trip_direction
+            jobs[job_id]["camp_lat"]      = camp_lat_val
+            jobs[job_id]["camp_lon"]      = camp_lon_val
 
     except Exception as e:
         import traceback
@@ -157,11 +163,13 @@ def api_run():
     job_id = str(uuid.uuid4())[:8]
     with jobs_lock:
         jobs[job_id] = {
-            "status":      "queued",
-            "progress":    [f"✓ Loaded {len(students)} students, {len(vcfgs)} vehicles"],
-            "output_path": None,
-            "route_data":  None,
-            "error":       None,
+            "status":       "queued",
+            "progress":     [f"✓ Loaded {len(students)} students, {len(vcfgs)} vehicles"],
+            "output_path":  None,
+            "route_data":   None,
+            "error":        None,
+            "camp_address": camp_address,
+            "trip_direction": trip_direction,
         }
 
     threading.Thread(
@@ -185,6 +193,135 @@ def api_status(job_id: str):
         "error":      job.get("error"),
         "route_data": job.get("route_data"),
     })
+
+
+@app.route("/api/recalculate/<job_id>", methods=["POST"])
+def api_recalculate(job_id: str):
+    """
+    Accept manually edited route data, recompute drive times via Google,
+    regenerate the Excel file, and return updated route_data + download.
+    """
+    with jobs_lock:
+        job = jobs.get(job_id)
+    if not job:
+        return jsonify({"error": "Job not found"}), 404
+
+    edited_vehicles = request.json.get("vehicles", [])
+    if not edited_vehicles:
+        return jsonify({"error": "No vehicle data provided"}), 400
+
+    try:
+        from bus_route_optimizer import (
+            build_dashboard, build_vehicle_sheet,
+            route_leg_times, haversine_mi, CAMP_COORDS
+        )
+        from openpyxl import Workbook
+        import dataclasses
+
+        camp_address  = job.get("camp_address")  or "828 Elbow Lane, Warrington, PA 18976"
+        trip_direction = job.get("trip_direction") or "morning"
+
+        # Reconstruct Vehicle objects from edited JSON
+        vehicles = []
+        for vd in edited_vehicles:
+            stops = []
+            for sd in vd["stops"]:
+                from bus_route_optimizer import Stop
+                s = Stop.__new__(Stop)
+                s.address     = sd["address"]
+                s.rider_names = sd["rider_names"]
+                s.rider_count = sd["rider_count"]
+                s.lat         = sd.get("lat", 0.0)
+                s.lon         = sd.get("lon", 0.0)
+                s.drive_time  = sd.get("drive_time", "—")
+                stops.append(s)
+
+            from bus_route_optimizer import Vehicle, CAMP_COORDS as CC
+            veh = Vehicle(
+                name          = vd["name"],
+                start_address = vd["start_address"],
+                capacity      = vd["capacity"],
+                stops         = stops,
+                total_time    = vd.get("total_time", "—"),
+                total_distance= vd.get("total_distance", "—"),
+                under_threshold = vd.get("under_threshold", False),
+                start_lat     = vd.get("start_lat", 0.0),
+                start_lon     = vd.get("start_lon", 0.0),
+                camp_lat      = vd.get("camp_lat", CC[0]),
+                camp_lon      = vd.get("camp_lon", CC[1]),
+            )
+
+            # Resequence stops geographically (nearest-neighbour toward camp)
+            if len(veh.stops) > 1:
+                camp_lat = veh.camp_lat or CC[0]
+                camp_lon = veh.camp_lon or CC[1]
+                unvisited = list(veh.stops)
+                is_afternoon = trip_direction == "afternoon"
+                first = (min if is_afternoon else max)(
+                    unvisited,
+                    key=lambda s: haversine_mi(s.lat, s.lon, camp_lat, camp_lon)
+                )
+                ordered = [first]
+                unvisited.remove(first)
+                while unvisited:
+                    last = ordered[-1]
+                    cur_d2c = haversine_mi(last.lat, last.lon, camp_lat, camp_lon)
+                    best, best_score = None, float("inf")
+                    for s in unvisited:
+                        geo = haversine_mi(last.lat, last.lon, s.lat, s.lon)
+                        d2c = haversine_mi(s.lat, s.lon, camp_lat, camp_lon)
+                        pen = max(0, d2c - cur_d2c) * 0.5 if not is_afternoon else max(0, cur_d2c - d2c) * 0.5
+                        if geo + pen < best_score:
+                            best_score, best = geo + pen, s
+                    ordered.append(best)
+                    unvisited.remove(best)
+                veh.stops = ordered
+
+            # Recalculate drive times
+            if veh.stops and (veh.start_lat or veh.start_lon):
+                coord_seq = ([(veh.start_lat, veh.start_lon)]
+                             + [(s.lat, s.lon) for s in veh.stops]
+                             + [(veh.camp_lat or CC[0], veh.camp_lon or CC[1])])
+                legs = route_leg_times(coord_seq)
+                for i, stop in enumerate(veh.stops):
+                    mins = max(1, round(legs[i]))
+                    stop.drive_time = f"{mins} min from start" if i == 0 else f"{mins} min"
+                total_mins = round(sum(legs))
+                hrs, rem = divmod(total_mins, 60)
+                veh.total_time = f"{hrs} hr {rem} min" if hrs and rem else (f"{hrs} hr" if hrs else f"{total_mins} min")
+                total_mi = sum(
+                    haversine_mi(coord_seq[i][0], coord_seq[i][1],
+                                 coord_seq[i+1][0], coord_seq[i+1][1]) * 1.35
+                    for i in range(len(coord_seq)-1)
+                )
+                veh.total_distance = f"{round(total_mi, 1)} mi"
+
+            cap = veh.capacity
+            eff = 0.40 if cap <= 6 else (0.50 if cap <= 9 else 0.60)
+            veh.under_threshold = (veh.rider_count / cap < eff) if cap else False
+            vehicles.append(veh)
+
+        # Regenerate Excel
+        output_path = os.path.join("outputs", f"routes_{job_id}_edited.xlsx")
+        wb = Workbook()
+        build_dashboard(wb, vehicles, camp_address=camp_address, trip_direction=trip_direction)
+        for veh in vehicles:
+            build_vehicle_sheet(wb, veh, camp_address=camp_address, trip_direction=trip_direction)
+        wb.save(output_path)
+
+        # Update job with new data
+        with jobs_lock:
+            jobs[job_id]["output_path"] = output_path
+            jobs[job_id]["route_data"]  = vehicles_to_json(vehicles)
+
+        return jsonify({
+            "status":     "ok",
+            "route_data": jobs[job_id]["route_data"],
+        })
+
+    except Exception as e:
+        import traceback
+        return jsonify({"error": str(e), "trace": traceback.format_exc()}), 500
 
 
 @app.route("/api/download/<job_id>")
@@ -321,6 +458,21 @@ label.lbl{display:block;font-size:.75rem;font-weight:600;color:var(--brand-dark)
 
 /* ── RESULTS TAB ── */
 .results-empty{text-align:center;padding:4rem 2rem;color:#bbb}
+.unassigned-tray{background:#fff8e6;border:1.5px dashed var(--gold);border-radius:var(--r);padding:1rem 1.25rem;margin-bottom:1rem;display:none}
+.unassigned-tray.visible{display:block}
+.unassigned-title{font-family:'Roboto Slab',serif;font-size:.85rem;font-weight:700;color:#7a4f00;margin-bottom:.65rem;text-transform:uppercase;letter-spacing:.04em}
+.unassigned-list{display:flex;flex-wrap:wrap;gap:.5rem;margin-bottom:.75rem}
+.unassigned-chip{display:flex;align-items:center;gap:.4rem;background:#fff3cd;border:1px solid #f0c060;border-radius:20px;padding:.3rem .75rem;font-size:.78rem;font-weight:500;color:#7a4f00}
+.unassigned-chip select{border:none;background:transparent;font-size:.75rem;color:#7a4f00;cursor:pointer;padding:0 .2rem;font-weight:600}
+.reassign-btn{padding:.25rem .65rem;background:var(--brand);color:#fff;border:none;border-radius:6px;font-size:.72rem;font-weight:600;cursor:pointer;transition:background .15s}
+.reassign-btn:hover{background:var(--brand-dark)}
+.rider-remove{background:none;border:none;cursor:pointer;color:#bbb;font-size:.8rem;padding:0 .1rem;line-height:1;transition:color .15s;margin-left:.15rem}
+.rider-remove:hover{color:var(--brand)}
+.recalc-bar{display:none;align-items:center;gap:.75rem;padding:.65rem 1rem;background:#edfaf3;border:1px solid #a3d9b8;border-radius:8px;margin-bottom:.75rem;font-size:.82rem;color:var(--success)}
+.recalc-bar.visible{display:flex}
+.recalc-btn{padding:.4rem 1rem;background:var(--success);color:#fff;border:none;border-radius:6px;font-size:.8rem;font-weight:600;cursor:pointer;margin-left:auto;transition:background .15s}
+.recalc-btn:hover{background:#1a4f38}
+.recalc-btn:disabled{opacity:.5;cursor:not-allowed}
 .results-empty .empty-icon{font-size:3rem;margin-bottom:1rem}
 .results-empty p{font-size:.9rem;line-height:1.6}
 
@@ -372,6 +524,21 @@ label.lbl{display:block;font-size:.75rem;font-weight:600;color:var(--brand-dark)
 .stop-riders{color:#555}
 .stop-time{color:#888;white-space:nowrap}
 .stop-row-start td,.stop-row-arrive td{background:var(--brand-light)!important}
+.rider-pill{display:inline-flex;align-items:center;gap:.25rem;background:var(--brand-light);color:var(--brand-dark);border-radius:10px;padding:.1rem .5rem;font-size:.72rem;font-weight:500;margin:.1rem .15rem .1rem 0}
+.rider-remove{background:none;border:none;cursor:pointer;color:var(--brand-mid);font-size:.75rem;line-height:1;padding:0;opacity:.6;transition:opacity .15s}
+.rider-remove:hover{opacity:1}
+.unassigned-tray{background:#fff8e6;border:1.5px dashed #f0c060;border-radius:var(--r);padding:1rem 1.25rem;margin-bottom:1rem}
+.unassigned-title{font-family:'Roboto Slab',serif;font-size:.85rem;font-weight:700;color:#7a4f00;margin-bottom:.6rem;display:flex;align-items:center;gap:.5rem}
+.unassigned-list{display:flex;flex-wrap:wrap;gap:.4rem;margin-bottom:.75rem}
+.unassigned-pill{display:inline-flex;align-items:center;gap:.4rem;background:#fff3cd;border:1px solid #f0c060;border-radius:8px;padding:.3rem .7rem;font-size:.78rem;font-weight:500;color:#7a4f00}
+.unassigned-pill select{border:none;background:transparent;font-size:.75rem;color:#7a4f00;cursor:pointer;outline:none;font-family:'DM Sans',sans-serif}
+.unassigned-pill .assign-btn{background:var(--brand);color:#fff;border:none;border-radius:6px;padding:.2rem .55rem;font-size:.7rem;font-weight:600;cursor:pointer;transition:background .15s}
+.unassigned-pill .assign-btn:hover{background:var(--brand-dark)}
+.recalc-btn{display:inline-flex;align-items:center;gap:.5rem;padding:.6rem 1.25rem;background:#2d6a4f;color:#fff;border:none;border-radius:8px;font-family:'Roboto Slab',serif;font-size:.82rem;font-weight:600;cursor:pointer;transition:background .15s;letter-spacing:.03em;text-transform:uppercase}
+.recalc-btn:hover{background:#1e4f3a}
+.recalc-btn:disabled{opacity:.5;cursor:not-allowed}
+.edit-bar{display:flex;align-items:center;gap:.75rem;margin-bottom:.75rem;flex-wrap:wrap}
+.edit-hint{font-size:.75rem;color:#999;font-style:italic}
 .stop-row-start .stop-num{color:var(--brand-mid)}
 .stop-row-arrive .stop-num{color:var(--success);font-weight:700}
 .stop-row-arrive .stop-time{color:var(--success);font-weight:600}
@@ -588,6 +755,18 @@ label.lbl{display:block;font-size:.75rem;font-weight:600;color:var(--brand-dark)
           <tbody id="summary-tbody"></tbody>
         </table>
       </div>
+    </div>
+
+    <!-- Recalculate bar -->
+    <div class="recalc-bar" id="recalc-bar">
+      <span>✏️ You have unsaved changes — recalculate to update times and Excel</span>
+      <button class="recalc-btn" id="recalc-btn" onclick="recalculate()">Recalculate Routes</button>
+    </div>
+
+    <!-- Unassigned students tray -->
+    <div class="unassigned-tray" id="unassigned-tray">
+      <div class="unassigned-title">⚠ Unassigned Students</div>
+      <div class="unassigned-list" id="unassigned-list"></div>
     </div>
 
     <!-- Vehicle route cards -->
@@ -893,11 +1072,12 @@ document.getElementById('view-results-btn').addEventListener('click', () => {
 });
 
 // ── Build results tab ──────────────────────────────────────────────────────
-function buildResultsTab(vehicles, jobId) {
+function buildResultsTab(vehicles, jobId, initEditable=true) {
   document.getElementById('results-empty').style.display = 'none';
   document.getElementById('results-content').style.display = 'block';
-  // Hide stale banner if this is a fresh run
   if (jobId) document.getElementById('results-stale').style.display = 'none';
+  // Initialise editable copy on fresh load (not on rebuild after edit)
+  if (initEditable) initEditableRoutes(vehicles);
 
   const totalRiders = vehicles.reduce((s, v) => s + v.rider_count, 0);
   const totalCap    = vehicles.reduce((s, v) => s + v.capacity, 0);
@@ -943,6 +1123,23 @@ function buildResultsTab(vehicles, jobId) {
   `;
   tbody.appendChild(totTr);
 
+  // Initialise editable copy
+  initEditableRoutes(vehicles);
+
+  // Move unassigned tray to results content (shared across all vehicles)
+  let unassignedTray = document.getElementById('unassigned-tray');
+  if (!unassignedTray) {
+    const tray = document.createElement('div');
+    tray.id = 'unassigned-tray';
+    tray.className = 'unassigned-tray';
+    tray.style.display = 'none';
+    tray.innerHTML = `<div class="unassigned-title">⚠ Unassigned Students — assign them to a vehicle then click Recalculate</div><div class="unassigned-list" id="unassigned-list"></div>`;
+    document.getElementById('results-content').insertBefore(tray, document.getElementById('veh-list'));
+  } else {
+    unassignedTray.style.display = 'none';
+    document.getElementById('unassigned-list').innerHTML = '';
+  }
+
   // Vehicle accordion cards
   const vehList = document.getElementById('veh-list');
   vehList.innerHTML = '';
@@ -968,11 +1165,22 @@ function buildResultsTab(vehicles, jobId) {
         <span class="veh-chevron">▼</span>
       </div>
       <div class="veh-body">
-        ${v.under_threshold ? `<div style="background:#fff3cd;border:1px solid #f0c060;border-radius:6px;padding:.6rem .9rem;font-size:.78rem;color:#7a4f00;margin-bottom:.75rem">⚠ This vehicle is below 75% capacity — it serves a geographically isolated area that cannot be merged without splitting neighbour groups.</div>` : ''}
+        ${v.under_threshold ? `<div style="background:#fff3cd;border:1px solid #f0c060;border-radius:6px;padding:.6rem .9rem;font-size:.78rem;color:#7a4f00;margin-bottom:.75rem">⚠ This vehicle is below 60% capacity — it serves a geographically isolated area that cannot be merged without splitting neighbour groups.</div>` : ''}
         <div class="veh-map" id="${mapId}">
           <div class="map-loading">⏳ Loading map…</div>
         </div>
-        <table class="stop-table">
+        <div class="edit-bar">
+          <button class="recalc-btn" id="recalc-${v.name.replace(/\s+/g,'-')}"
+                  onclick="recalculateRoutes()" disabled>
+            ↻ Recalculate Routes
+          </button>
+          <span class="edit-hint">Click ✕ on a rider to remove them from this route</span>
+        </div>
+        <div id="unassigned-tray" style="display:none" class="unassigned-tray">
+          <div class="unassigned-title">⚠ Unassigned Students</div>
+          <div class="unassigned-list" id="unassigned-list"></div>
+        </div>
+        <table class="stop-table" id="stop-table-${v.name.replace(/\s+/g,'-')}">
           <thead><tr><th>#</th><th>Address</th><th>Riders</th><th>Drive Time</th></tr></thead>
           <tbody>
             <tr class="stop-row-start">
@@ -985,11 +1193,15 @@ function buildResultsTab(vehicles, jobId) {
               const street = addrParts[0] || s.address;
               const cityState = addrParts.slice(1).join(',').trim();
               const riderPills = s.rider_names.split(', ')
-                .map(r => `<span class="rider-pill">${r}</span>`).join('');
-              return `<tr>
+                .filter(r => r.trim())
+                .map(r => `<span class="rider-pill" data-rider="${r}" data-vehicle="${v.name}" data-address="${s.address}">
+                  ${r}
+                  <button class="rider-remove" title="Remove ${r}" onclick="removeRider(this, '${r}', '${v.name}', '${s.address}')">✕</button>
+                </span>`).join('');
+              return `<tr data-address="${s.address}" data-vehicle="${v.name}">
                 <td class="stop-num">${s.stop_num}</td>
                 <td class="stop-addr">${street}<div class="stop-city">${cityState}</div></td>
-                <td class="stop-riders">${riderPills}<br><span style="font-size:.7rem;color:#aaa">${s.rider_count} rider${s.rider_count!==1?'s':''}</span></td>
+                <td class="stop-riders">${riderPills}<br><span class="stop-rider-count" style="font-size:.7rem;color:#aaa">${s.rider_count} rider${s.rider_count!==1?'s':''}</span></td>
                 <td class="stop-time">${s.drive_time}</td>
               </tr>`;
             }).join('')}
@@ -1173,6 +1385,454 @@ function renderGoogleMap(el, mapId, allPoints, vehicle, campAddr) {
     allPoints.forEach(p => bounds.extend({lat: p.lat, lng: p.lng}));
     map.fitBounds(bounds, {top:30, right:30, bottom:30, left:30});
   });
+}
+
+// ── Manual editing ─────────────────────────────────────────────────────────
+
+// In-memory editable copy of route data
+let editableRoutes = null;
+let hasEdits = false;
+
+function initEditableRoutes(vehicles) {
+  // Deep clone so we can edit without touching the original
+  editableRoutes = JSON.parse(JSON.stringify(vehicles));
+  hasEdits = false;
+}
+
+function removeRider(btn, riderName, vehicleName, stopAddress) {
+  if (!editableRoutes) return;
+
+  // Find vehicle and stop in editableRoutes
+  const veh = editableRoutes.find(v => v.name === vehicleName);
+  if (!veh) return;
+  const stop = veh.stops.find(s => s.address === stopAddress);
+  if (!stop) return;
+
+  // Remove rider from stop
+  const riders = stop.rider_names.split(', ').filter(r => r.trim() && r !== riderName);
+  stop.rider_names = riders.join(', ');
+  stop.rider_count = riders.length;
+
+  // Remove the pill from DOM
+  const pill = btn.closest('.rider-pill');
+  pill.remove();
+
+  // Update rider count label
+  const row = btn.closest('tr');
+  const countEl = row.querySelector('.stop-rider-count');
+  if (countEl) countEl.textContent = `${riders.length} rider${riders.length !== 1 ? 's' : ''}`;
+
+  // If stop is now empty, remove the row
+  if (riders.length === 0) {
+    veh.stops = veh.stops.filter(s => s.address !== stopAddress);
+    row.remove();
+  }
+
+  // Add to unassigned tray — pass coords and address so reassignment works
+  addToUnassignedTray(riderName, vehicleName, stopAddress, stop.lat, stop.lon);
+
+  // Update vehicle header stats
+  updateVehicleHeader(vehicleName);
+
+  // Enable recalculate button
+  hasEdits = true;
+  document.querySelectorAll('.recalc-btn').forEach(b => b.disabled = false);
+}
+
+function addToUnassignedTray(riderName, fromVehicle, address, lat, lon) {
+  const tray = document.getElementById('unassigned-tray');
+  const list = document.getElementById('unassigned-list');
+  tray.style.display = 'block';
+
+  const vehicleOptions = editableRoutes
+    .map(v => `<option value="${v.name}" ${v.name === fromVehicle ? 'disabled' : ''}>${v.name}</option>`)
+    .join('');
+
+  const pill = document.createElement('div');
+  pill.className = 'unassigned-pill';
+  pill.dataset.rider   = riderName;
+  pill.dataset.address = address || '';
+  pill.dataset.lat     = lat || 0;
+  pill.dataset.lon     = lon || 0;
+  pill.innerHTML = `
+    <span>${riderName}</span>
+    <span style="font-size:.7rem;opacity:.7">from ${fromVehicle}</span>
+    <select title="Assign to vehicle">
+      <option value="">Assign to...</option>
+      ${vehicleOptions}
+    </select>
+    <button class="assign-btn" onclick="assignRider(this, '${riderName}')">→</button>
+  `;
+  list.appendChild(pill);
+}
+
+function assignRider(btn, riderName) {
+  const pill = btn.closest('.unassigned-pill');
+  const select = pill.querySelector('select');
+  const targetVehicleName = select.value;
+  if (!targetVehicleName) { alert('Please select a vehicle first'); return; }
+
+  const targetVeh = editableRoutes.find(v => v.name === targetVehicleName);
+  if (!targetVeh) return;
+
+  // Check capacity
+  const currentRiders = targetVeh.stops.reduce((s, st) => s + st.rider_count, 0);
+  if (currentRiders >= targetVeh.capacity) {
+    alert(`${targetVehicleName} is already at full capacity (${targetVeh.capacity} riders)`);
+    return;
+  }
+
+  // Find if there's already a stop for this rider's address, or add new
+  // For simplicity, we need to know the address — store it on the pill
+  // Since we don't have the address here, add as a new stop with a placeholder
+  // The recalculate will handle resequencing
+  const existingStops = targetVeh.stops;
+
+  // Add rider to a new stop (address lookup happens on recalculate)
+  // For now, find if there's a stop we can append to by checking the unassigned pill's origin data
+  // Check if target vehicle already has a stop at this address
+  const riderAddr = pill.dataset.address || '';
+  const existingStop = riderAddr ? targetVeh.stops.find(s => s.address === riderAddr) : null;
+
+  if (existingStop) {
+    // Add rider to existing stop at same address
+    const riders = existingStop.rider_names ? existingStop.rider_names.split(', ') : [];
+    riders.push(riderName);
+    existingStop.rider_names = riders.join(', ');
+    existingStop.rider_count = riders.length;
+  } else {
+    // Create new stop
+    const newStop = {
+      address:      riderAddr || '(address unknown)',
+      rider_names:  riderName,
+      rider_count:  1,
+      drive_time:   '—',
+      lat:          pill.dataset.lat ? parseFloat(pill.dataset.lat) : 0,
+      lon:          pill.dataset.lon ? parseFloat(pill.dataset.lon) : 0,
+      stop_num:     existingStops.length + 1,
+    };
+    targetVeh.stops.push(newStop);
+  }
+  // Remove the fake newStop push below
+
+  // Remove from tray
+  pill.remove();
+  const list = document.getElementById('unassigned-list');
+  if (!list.children.length) {
+    document.getElementById('unassigned-tray').style.display = 'none';
+  }
+
+  // Update header
+  updateVehicleHeader(targetVehicleName);
+
+  // Rebuild that vehicle's stop table in DOM
+  rebuildStopTable(targetVehicleName);
+
+  hasEdits = true;
+  document.querySelectorAll('.recalc-btn').forEach(b => b.disabled = false);
+}
+
+function updateVehicleHeader(vehicleName) {
+  // Update rider count in the vehicle header
+  const veh = editableRoutes.find(v => v.name === vehicleName);
+  if (!veh) return;
+  const totalRiders = veh.stops.reduce((s, st) => s + st.rider_count, 0);
+  // Find the card and update stats
+  document.querySelectorAll('.veh-card').forEach(card => {
+    const nameEl = card.querySelector('.veh-name');
+    if (nameEl && nameEl.textContent === vehicleName) {
+      const statEl = card.querySelector('.veh-stat');
+      if (statEl) statEl.innerHTML = `<strong>${totalRiders}</strong>/${veh.capacity} riders`;
+    }
+  });
+}
+
+function rebuildStopTable(vehicleName) {
+  // Rebuild stop rows for a vehicle after assignment
+  const veh = editableRoutes.find(v => v.name === vehicleName);
+  if (!veh) return;
+  const tableId = `stop-table-${vehicleName.replace(/\s+/g, '-')}`;
+  const table = document.getElementById(tableId);
+  if (!table) return;
+  const tbody = table.querySelector('tbody');
+  if (!tbody) return;
+
+  // Rebuild stop rows (keep start and arrive rows)
+  const rows = Array.from(tbody.querySelectorAll('tr'));
+  const startRow  = rows.find(r => r.classList.contains('stop-row-start'));
+  const arriveRow = rows.find(r => r.classList.contains('stop-row-arrive'));
+
+  tbody.innerHTML = '';
+  if (startRow)  tbody.appendChild(startRow);
+  veh.stops.forEach((s, i) => {
+    const addrParts = s.address.split(',');
+    const street = addrParts[0] || s.address;
+    const cityState = addrParts.slice(1).join(',').trim();
+    const pills = s.rider_names.split(', ').filter(r => r.trim())
+      .map(r => `<span class="rider-pill" data-rider="${r}">
+        ${r}
+        <button class="rider-remove" onclick="removeRider(this, '${r}', '${vehicleName}', '${s.address}')">✕</button>
+      </span>`).join('');
+    const tr = document.createElement('tr');
+    tr.dataset.address = s.address;
+    tr.dataset.vehicle = vehicleName;
+    tr.innerHTML = `
+      <td class="stop-num">${i+1}</td>
+      <td class="stop-addr">${street}<div class="stop-city">${cityState}</div></td>
+      <td class="stop-riders">${pills}<br><span class="stop-rider-count" style="font-size:.7rem;color:#aaa">${s.rider_count} rider${s.rider_count !== 1 ? 's' : ''}</span></td>
+      <td class="stop-time">${s.drive_time}</td>
+    `;
+    tbody.appendChild(tr);
+  });
+  if (arriveRow) tbody.appendChild(arriveRow);
+}
+
+async function recalculateRoutes() {
+  if (!editableRoutes || !currentJobId) return;
+
+  // Store rider addresses on unassigned pills before sending
+  document.querySelectorAll('.unassigned-pill').forEach(pill => {
+    const riderName = pill.dataset.rider;
+    // Try to find the address from original routeData
+    if (routeData) {
+      for (const v of routeData) {
+        for (const s of v.stops) {
+          if (s.rider_names.split(', ').includes(riderName)) {
+            pill.dataset.address = s.address;
+            pill.dataset.lat = s.lat;
+            pill.dataset.lon = s.lon;
+          }
+        }
+      }
+    }
+  });
+
+  document.querySelectorAll('.recalc-btn').forEach(b => {
+    b.disabled = true;
+    b.textContent = '↻ Recalculating…';
+  });
+
+  try {
+    const resp = await fetch(`/api/recalculate/${currentJobId}`, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({vehicles: editableRoutes}),
+    });
+    const data = await resp.json();
+
+    if (data.error) {
+      alert('Recalculation error: ' + data.error);
+      return;
+    }
+
+    // Update routes with recalculated data
+    routeData = data.route_data;
+    editableRoutes = JSON.parse(JSON.stringify(routeData));
+    hasEdits = false;
+
+    // Rebuild the entire results tab with fresh data
+    buildResultsTab(routeData, currentJobId);
+    initEditableRoutes(routeData);
+
+    // Save updated results to localStorage
+    try {
+      const campAddr = document.getElementById('camp-address').value.trim();
+      localStorage.setItem('elbow_last_routes', JSON.stringify({
+        vehicles: routeData,
+        savedAt:  new Date().toLocaleDateString('en-US', {month:'short',day:'numeric',year:'numeric',hour:'numeric',minute:'2-digit'}),
+        tripDir:  tripDirection,
+        campAddr: campAddr,
+      }));
+    } catch(e) {}
+
+  } catch(err) {
+    alert('Network error: ' + err.message);
+  } finally {
+    document.querySelectorAll('.recalc-btn').forEach(b => {
+      b.disabled = false;
+      b.textContent = '↻ Recalculate Routes';
+    });
+  }
+}
+
+// ── Reassignment logic ─────────────────────────────────────────────────────
+
+// In-memory editable copy of route data
+let editableRoutes = null;
+let unassignedRiders = [];  // [{name, fromVehicle, stopAddress, lat, lon}]
+
+function initEditableRoutes(vehicles) {
+  // Deep copy so we can mutate without affecting original
+  editableRoutes = JSON.parse(JSON.stringify(vehicles));
+  unassignedRiders = [];
+  updateUnassignedTray();
+  document.getElementById('recalc-bar').classList.remove('visible');
+}
+
+function removeRider(btn, vehicleName, stopIdx, riderName) {
+  if (!editableRoutes) return;
+
+  const veh = editableRoutes.find(v => v.name === vehicleName);
+  if (!veh) return;
+
+  const stop = veh.stops[stopIdx];
+  if (!stop) return;
+
+  // Remove rider from stop
+  const riderList = stop.rider_names.split(', ').filter(r => r.trim() && r !== riderName);
+  
+  if (riderList.length === 0) {
+    // Last rider at this stop — remove the whole stop
+    veh.stops.splice(stopIdx, 1);
+  } else {
+    stop.rider_names = riderList.join(', ');
+    stop.rider_count = riderList.length;
+  }
+
+  // Add to unassigned tray
+  unassignedRiders.push({
+    name: riderName,
+    fromVehicle: vehicleName,
+    stopAddress: stop.address,
+    lat: stop.lat,
+    lon: stop.lon,
+  });
+
+  // Show recalculate bar
+  document.getElementById('recalc-bar').classList.add('visible');
+
+  // Rebuild results display
+  buildResultsTab(editableRoutes, currentJobId, false);
+  updateUnassignedTray();
+}
+
+function updateUnassignedTray() {
+  const tray = document.getElementById('unassigned-tray');
+  const list = document.getElementById('unassigned-list');
+
+  if (unassignedRiders.length === 0) {
+    tray.classList.remove('visible');
+    return;
+  }
+
+  tray.classList.add('visible');
+
+  // Build vehicle options for dropdown
+  const vehOptions = (editableRoutes || [])
+    .map(v => `<option value="${v.name}">${v.name}</option>`)
+    .join('');
+
+  list.innerHTML = unassignedRiders.map((r, i) => `
+    <div class="unassigned-chip">
+      <span>${r.name}</span>
+      <span style="color:#aaa;font-size:.7rem">from ${r.fromVehicle}</span>
+      <select id="assign-select-${i}">
+        <option value="">Assign to...</option>
+        ${vehOptions}
+      </select>
+      <button class="reassign-btn" onclick="assignRider(${i})">Move</button>
+    </div>
+  `).join('');
+}
+
+function assignRider(idx) {
+  const select = document.getElementById(`assign-select-${idx}`);
+  const targetVehicleName = select.value;
+  if (!targetVehicleName || !editableRoutes) return;
+
+  const rider = unassignedRiders[idx];
+  const targetVeh = editableRoutes.find(v => v.name === targetVehicleName);
+  if (!targetVeh) return;
+
+  // Check capacity
+  const currentRiders = targetVeh.stops.reduce((s, st) => s + (st.rider_count || 1), 0);
+  if (currentRiders >= targetVeh.capacity) {
+    alert(`${targetVehicleName} is already at full capacity (${targetVeh.capacity} riders)`);
+    return;
+  }
+
+  // Find if there's already a stop at this address on the target vehicle
+  const existingStop = targetVeh.stops.find(s => s.address === rider.stopAddress);
+  if (existingStop) {
+    existingStop.rider_names = existingStop.rider_names
+      ? existingStop.rider_names + ', ' + rider.name
+      : rider.name;
+    existingStop.rider_count = (existingStop.rider_count || 0) + 1;
+  } else {
+    // Add as new stop
+    targetVeh.stops.push({
+      stop_num:    targetVeh.stops.length + 1,
+      address:     rider.stopAddress,
+      rider_names: rider.name,
+      rider_count: 1,
+      drive_time:  '— recalculate',
+      lat:         rider.lat,
+      lon:         rider.lon,
+    });
+  }
+
+  // Remove from unassigned
+  unassignedRiders.splice(idx, 1);
+
+  // Rebuild display
+  buildResultsTab(editableRoutes, currentJobId, false);
+  updateUnassignedTray();
+  document.getElementById('recalc-bar').classList.add('visible');
+}
+
+async function recalculate() {
+  if (!editableRoutes || !currentJobId) return;
+
+  const btn = document.getElementById('recalc-btn');
+  btn.disabled = true;
+  btn.textContent = 'Recalculating…';
+
+  try {
+    const resp = await fetch(`/api/reassign/${currentJobId}`, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({vehicles: editableRoutes}),
+    });
+    const data = await resp.json();
+
+    if (data.error) {
+      alert('Recalculation failed: ' + data.error);
+      return;
+    }
+
+    // Update with fresh data from server
+    routeData = data.route_data;
+    editableRoutes = JSON.parse(JSON.stringify(routeData));
+    unassignedRiders = [];
+
+    buildResultsTab(editableRoutes, currentJobId, false);
+    updateUnassignedTray();
+
+    document.getElementById('recalc-bar').classList.remove('visible');
+    document.getElementById('recalc-bar').innerHTML = `
+      <span>✅ Routes recalculated successfully</span>
+      <button class="recalc-btn" id="recalc-btn" onclick="recalculate()">Recalculate Again</button>
+    `;
+    document.getElementById('recalc-bar').classList.add('visible');
+    setTimeout(() => document.getElementById('recalc-bar').classList.remove('visible'), 3000);
+
+    // Save to localStorage
+    try {
+      const campAddr = document.getElementById('camp-address').value.trim();
+      localStorage.setItem('elbow_last_routes', JSON.stringify({
+        vehicles: routeData,
+        savedAt: new Date().toLocaleDateString('en-US', {month:'short',day:'numeric',year:'numeric',hour:'numeric',minute:'2-digit'}),
+        tripDir:  tripDirection,
+        campAddr: campAddr,
+      }));
+    } catch(e) {}
+
+  } catch(e) {
+    alert('Network error: ' + e.message);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = 'Recalculate Routes';
+  }
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────────
