@@ -348,6 +348,7 @@ HTML = r"""<!DOCTYPE html>
 <meta charset="UTF-8">
 <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
 <meta http-equiv="Pragma" content="no-cache">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🚌</text></svg>">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Elbow Lane — Bus Route Optimizer</title>
 <script>
@@ -1250,8 +1251,10 @@ function initVehicleMap(mapId, vehicle) {
 
   // Map shows stop 1 → stop N → camp only (no garage-to-first-stop leg)
   vehicle.stops.forEach((s, i) => {
-    if (s.lat && s.lon && (s.lat !== 0 || s.lon !== 0)) {
-      allPoints.push({lat: s.lat, lng: s.lon, label: String(i+1), type: 'stop',
+    const lat = parseFloat(s.lat);
+    const lng = parseFloat(s.lon);
+    if (!isNaN(lat) && !isNaN(lng) && Math.abs(lat) > 0.001 && Math.abs(lng) > 0.001) {
+      allPoints.push({lat, lng, label: String(i+1), type: 'stop',
                       riders: s.rider_names, address: s.address.split(',')[0]});
     }
   });
@@ -1341,46 +1344,70 @@ async function renderGoogleMap(el, mapId, allPoints, vehicle, campAddr) {
   });
 
   // Draw route with Google Directions Service
-  const directionsService  = new google.maps.DirectionsService();
-  const directionsRenderer = new google.maps.DirectionsRenderer({
-    map,
-    suppressMarkers: true,
-    polylineOptions: {strokeColor: BRAND, strokeWeight: 4, strokeOpacity: .85}
-  });
+  const directionsService = new google.maps.DirectionsService();
 
-  const waypoints = allPoints.slice(1, -1).map(p => ({
-    location: new google.maps.LatLng(p.lat, p.lng),
-    stopover: true,
-  }));
+  // Split route into chunks of max 8 waypoints each to stay within Google limits
+  // Pattern: [stop0 → stop1..8 → stop9] [stop9 → stop10..17 → stop18] ... [lastStop → camp]
+  const MAX_WP = 8;
+  const stopPoints = allPoints; // stops only (camp already appended as last point)
+  const segments = [];
 
-  // Google Directions allows max 25 waypoints — if more, draw polyline fallback
-  const MAX_WP = 23;
-  const waypointsToUse = waypoints.length <= MAX_WP ? waypoints : waypoints.filter((_,i) => i % Math.ceil(waypoints.length/MAX_WP) === 0);
+  for (let i = 0; i < stopPoints.length - 1; i += MAX_WP) {
+    const chunk = stopPoints.slice(i, Math.min(i + MAX_WP + 1, stopPoints.length));
+    if (chunk.length >= 2) segments.push(chunk);
+  }
 
-  directionsService.route({
-    origin:      new google.maps.LatLng(allPoints[0].lat, allPoints[0].lng),
-    destination: new google.maps.LatLng(allPoints[allPoints.length-1].lat, allPoints[allPoints.length-1].lng),
-    waypoints:   waypointsToUse,
-    travelMode:  google.maps.TravelMode.DRIVING,
-    optimizeWaypoints: false,
-  }, (result, status) => {
-    if (status === 'OK') {
-      directionsRenderer.setDirections(result);
-    } else {
-      // Fallback polyline
-      new google.maps.Polyline({
-        path:          allPoints.map(p => ({lat: p.lat, lng: p.lng})),
-        map,
-        strokeColor:   BRAND,
-        strokeWeight:  3,
-        strokeOpacity: .7,
-        icons: [{icon:{path:'M 0,-1 0,1',strokeOpacity:1,scale:3},offset:'0',repeat:'12px'}],
-      });
-    }
-    const bounds = new google.maps.LatLngBounds();
-    allPoints.forEach(p => bounds.extend({lat: p.lat, lng: p.lng}));
-    map.fitBounds(bounds, {top:30, right:30, bottom:30, left:30});
-  });
+  const bounds = new google.maps.LatLngBounds();
+  allPoints.forEach(p => bounds.extend({lat: p.lat, lng: p.lng}));
+
+  let successCount = 0;
+
+  const drawSegment = (seg, idx) => {
+    const origin = seg[0];
+    const dest   = seg[seg.length - 1];
+    const wps    = seg.slice(1, -1).map(p => ({
+      location: new google.maps.LatLng(p.lat, p.lng),
+      stopover: true,
+    }));
+
+    directionsService.route({
+      origin:            new google.maps.LatLng(origin.lat, origin.lng),
+      destination:       new google.maps.LatLng(dest.lat,   dest.lng),
+      waypoints:         wps,
+      travelMode:        google.maps.TravelMode.DRIVING,
+      optimizeWaypoints: false,
+    }, (result, status) => {
+      if (status === 'OK') {
+        new google.maps.DirectionsRenderer({
+          map,
+          suppressMarkers:  true,
+          preserveViewport: true,
+          polylineOptions:  {strokeColor: BRAND, strokeWeight: 4, strokeOpacity: .85}
+        }).setDirections(result);
+        successCount++;
+      } else {
+        // Fallback: draw a simple polyline for this segment
+        new google.maps.Polyline({
+          path:          seg.map(p => ({lat: p.lat, lng: p.lng})),
+          map,
+          strokeColor:   BRAND,
+          strokeWeight:  3,
+          strokeOpacity: .6,
+          icons: [{icon:{path:'M 0,-1 0,1',strokeOpacity:1,scale:3},offset:'0',repeat:'12px'}],
+        });
+      }
+      // Fit bounds after last segment
+      if (idx === segments.length - 1) {
+        map.fitBounds(bounds, {top: 40, right: 40, bottom: 40, left: 40});
+      }
+    });
+  };
+
+  if (segments.length > 0) {
+    segments.forEach((seg, idx) => drawSegment(seg, idx));
+  } else {
+    map.fitBounds(bounds, {top: 40, right: 40, bottom: 40, left: 40});
+  }
 }
 
 // ── Manual editing ─────────────────────────────────────────────────────────
