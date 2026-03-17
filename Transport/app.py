@@ -181,6 +181,18 @@ def api_run():
     return jsonify({"job_id": job_id})
 
 
+@app.route("/api/clear-cache", methods=["POST"])
+def api_clear_cache():
+    """Delete geocache and routecache so all addresses are re-geocoded fresh."""
+    import os
+    cleared = []
+    for f in ["geocache.json", "routecache.json"]:
+        if os.path.exists(f):
+            os.remove(f)
+            cleared.append(f)
+    return jsonify({"cleared": cleared, "message": f"Cleared {len(cleared)} cache files. Next run will re-geocode all addresses using Google Maps."})
+
+
 @app.route("/api/status/<job_id>")
 def api_status(job_id: str):
     with jobs_lock:
@@ -704,6 +716,16 @@ label.lbl{display:block;font-size:.75rem;font-weight:600;color:var(--brand-dark)
   <div class="action-bar" id="action-bar" style="display:none">
     <a class="dl-btn" id="dl-link" href="#" download>⬇ Download Excel</a>
     <button class="view-btn" id="view-results-btn">📊 View Results</button>
+  </div>
+
+  <!-- Cache warning -->
+  <div id="cache-notice" style="display:none;margin-top:.6rem;background:#fff3cd;border:1px solid #f0c060;border-radius:8px;padding:.6rem 1rem;font-size:.78rem;color:#7a4f00">
+    ✅ Cache cleared — next run will re-geocode all addresses with Google Maps.
+  </div>
+  <div style="text-align:right;margin-top:.4rem">
+    <button onclick="clearCache()" style="background:none;border:none;color:#aaa;font-size:.72rem;cursor:pointer;text-decoration:underline">
+      Clear geocache (fixes wrong map locations)
+    </button>
   </div>
 
   <!-- Error -->
@@ -1629,6 +1651,18 @@ function showError(msg) {
   document.getElementById('error-card').classList.add('visible');
   document.getElementById('error-msg').textContent = msg;
   setRunning(false);
+}
+
+async function clearCache() {
+  try {
+    const resp = await fetch('/api/clear-cache', {method: 'POST'});
+    const data = await resp.json();
+    const notice = document.getElementById('cache-notice');
+    notice.style.display = 'block';
+    setTimeout(() => notice.style.display = 'none', 5000);
+  } catch(e) {
+    alert('Could not clear cache: ' + e.message);
+  }
 }
 
 // ── Init ───────────────────────────────────────────────────────────────────
