@@ -1123,9 +1123,6 @@ function buildResultsTab(vehicles, jobId, initEditable=true) {
   `;
   tbody.appendChild(totTr);
 
-  // Initialise editable copy
-  initEditableRoutes(vehicles);
-
   // Move unassigned tray to results content (shared across all vehicles)
   let unassignedTray = document.getElementById('unassigned-tray');
   if (!unassignedTray) {
@@ -1400,7 +1397,10 @@ function initEditableRoutes(vehicles) {
 }
 
 function removeRider(btn, riderName, vehicleName, stopAddress) {
-  if (!editableRoutes) return;
+  if (!editableRoutes) {
+    console.warn('editableRoutes not initialized');
+    return;
+  }
 
   // Find vehicle and stop in editableRoutes
   const veh = editableRoutes.find(v => v.name === vehicleName);
@@ -1660,13 +1660,6 @@ async function recalculateRoutes() {
 // In-memory editable copy of route data
 let unassignedRiders = [];  // [{name, fromVehicle, stopAddress, lat, lon}]
 
-function initEditableRoutes(vehicles) {
-  // Deep copy so we can mutate without affecting original
-  editableRoutes = JSON.parse(JSON.stringify(vehicles));
-  unassignedRiders = [];
-  updateUnassignedTray();
-  document.getElementById('recalc-bar').classList.remove('visible');
-}
 
 function removeRider(btn, vehicleName, stopIdx, riderName) {
   if (!editableRoutes) return;
