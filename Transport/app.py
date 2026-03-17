@@ -527,9 +527,8 @@ label.lbl{display:block;font-size:.75rem;font-weight:600;color:var(--brand-dark)
 .rider-pill{display:inline-flex;align-items:center;gap:.25rem;background:var(--brand-light);color:var(--brand-dark);border-radius:10px;padding:.1rem .5rem;font-size:.72rem;font-weight:500;margin:.1rem .15rem .1rem 0}
 .rider-remove{background:none;border:none;cursor:pointer;color:var(--brand-mid);font-size:.75rem;line-height:1;padding:0;opacity:.6;transition:opacity .15s}
 .rider-remove:hover{opacity:1}
-.unassigned-tray{background:#fff8e6;border:1.5px dashed #f0c060;border-radius:var(--r);padding:1rem 1.25rem;margin-bottom:1rem}
-.unassigned-title{font-family:'Roboto Slab',serif;font-size:.85rem;font-weight:700;color:#7a4f00;margin-bottom:.6rem;display:flex;align-items:center;gap:.5rem}
-.unassigned-list{display:flex;flex-wrap:wrap;gap:.4rem;margin-bottom:.75rem}
+
+
 .unassigned-pill{display:inline-flex;align-items:center;gap:.4rem;background:#fff3cd;border:1px solid #f0c060;border-radius:8px;padding:.3rem .7rem;font-size:.78rem;font-weight:500;color:#7a4f00}
 .unassigned-pill select{border:none;background:transparent;font-size:.75rem;color:#7a4f00;cursor:pointer;outline:none;font-family:'DM Sans',sans-serif}
 .unassigned-pill .assign-btn{background:var(--brand);color:#fff;border:none;border-radius:6px;padding:.2rem .55rem;font-size:.7rem;font-weight:600;cursor:pointer;transition:background .15s}
@@ -1123,18 +1122,12 @@ function buildResultsTab(vehicles, jobId, initEditable=true) {
   `;
   tbody.appendChild(totTr);
 
-  // Move unassigned tray to results content (shared across all vehicles)
-  let unassignedTray = document.getElementById('unassigned-tray');
-  if (!unassignedTray) {
-    const tray = document.createElement('div');
-    tray.id = 'unassigned-tray';
-    tray.className = 'unassigned-tray';
-    tray.style.display = 'none';
-    tray.innerHTML = `<div class="unassigned-title">⚠ Unassigned Students — assign them to a vehicle then click Recalculate</div><div class="unassigned-list" id="unassigned-list"></div>`;
-    document.getElementById('results-content').insertBefore(tray, document.getElementById('veh-list'));
-  } else {
-    unassignedTray.style.display = 'none';
-    document.getElementById('unassigned-list').innerHTML = '';
+  // Reset unassigned tray on fresh build
+  const unassignedTray = document.getElementById('unassigned-tray');
+  if (unassignedTray) {
+    unassignedTray.classList.remove('visible');
+    const list = document.getElementById('unassigned-list');
+    if (list) list.innerHTML = '';
   }
 
   // Vehicle accordion cards
@@ -1173,10 +1166,7 @@ function buildResultsTab(vehicles, jobId, initEditable=true) {
           </button>
           <span class="edit-hint">Click ✕ on a rider to remove them from this route</span>
         </div>
-        <div id="unassigned-tray" style="display:none" class="unassigned-tray">
-          <div class="unassigned-title">⚠ Unassigned Students</div>
-          <div class="unassigned-list" id="unassigned-list"></div>
-        </div>
+
         <table class="stop-table" id="stop-table-${v.name.replace(/\s+/g,'-')}">
           <thead><tr><th>#</th><th>Address</th><th>Riders</th><th>Drive Time</th></tr></thead>
           <tbody>
