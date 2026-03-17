@@ -221,20 +221,22 @@ def api_recalculate(job_id: str):
         camp_address  = job.get("camp_address")  or "828 Elbow Lane, Warrington, PA 18976"
         trip_direction = job.get("trip_direction") or "morning"
 
+        # Simple stop class for recalculate (avoids Stop dataclass property conflicts)
+        class EditableStop:
+            def __init__(self, d):
+                self.address     = d["address"]
+                self.rider_names = d.get("rider_names", "")
+                self.rider_count = int(d.get("rider_count", 0))
+                self.lat         = float(d.get("lat", 0) or 0)
+                self.lon         = float(d.get("lon", 0) or 0)
+                self.drive_time  = d.get("drive_time", "—")
+                self.geocoded    = True
+
         # Reconstruct Vehicle objects from edited JSON
         vehicles = []
         for vd in edited_vehicles:
-            stops = []
-            for sd in vd["stops"]:
-                from bus_route_optimizer import Stop
-                s = Stop.__new__(Stop)
-                s.address     = sd["address"]
-                s.rider_names = sd["rider_names"]
-                s.rider_count = sd["rider_count"]
-                s.lat         = sd.get("lat", 0.0)
-                s.lon         = sd.get("lon", 0.0)
-                s.drive_time  = sd.get("drive_time", "—")
-                stops.append(s)
+            stops = [EditableStop(sd) for sd in vd.get("stops", [])
+                     if sd.get("rider_names") and int(sd.get("rider_count", 0)) > 0]
 
             from bus_route_optimizer import Vehicle, CAMP_COORDS as CC
             veh = Vehicle(
@@ -1227,7 +1229,7 @@ function loadGoogleMapsAPI() {
   if (googleMapsLoaded || googleMapsLoading) return;
   googleMapsLoading = true;
   const script = document.createElement('script');
-  script.src = `https://maps.googleapis.com/maps/api/js?key=${window.GOOGLE_MAPS_KEY}&libraries=geometry&callback=onGoogleMapsLoaded`;
+  script.src = `https://maps.googleapis.com/maps/api/js?key=${window.GOOGLE_MAPS_KEY}&libraries=geometry,marker&callback=onGoogleMapsLoaded&v=beta`;
   script.async = true;
   document.head.appendChild(script);
 }
@@ -1271,7 +1273,7 @@ function initVehicleMap(mapId, vehicle) {
   renderGoogleMap(el, mapId, allPoints, vehicle, campAddr);
 }
 
-function renderGoogleMap(el, mapId, allPoints, vehicle, campAddr) {
+async function renderGoogleMap(el, mapId, allPoints, vehicle, campAddr) {
   el.innerHTML = '';
   initializedMaps[mapId] = true;
 
@@ -1285,15 +1287,12 @@ function renderGoogleMap(el, mapId, allPoints, vehicle, campAddr) {
   const map = new google.maps.Map(el, {
     center: {lat: avgLat, lng: avgLng},
     zoom: 11,
-    mapTypeId: 'roadmap',
+    mapId: 'elbow_lane_route_map',
     zoomControl: true,
     streetViewControl: false,
     mapTypeControl: false,
     fullscreenControl: true,
-    styles: [
-      {featureType:'poi',elementType:'labels',stylers:[{visibility:'off'}]},
-      {featureType:'transit',stylers:[{visibility:'off'}]},
-    ]
+    mapTypeId: 'roadmap',
   });
 
   function makeIcon(label, bg, fg, size) {
@@ -1312,21 +1311,31 @@ function renderGoogleMap(el, mapId, allPoints, vehicle, campAddr) {
 
   const infoWindow = new google.maps.InfoWindow();
 
+  const { AdvancedMarkerElement } = await google.maps.importLibrary("marker");
   allPoints.forEach((pt, i) => {
-    let icon, content;
-    if (pt.type === 'start') {
-      icon    = makeIcon('▶', BRAND, '#fff', 32);
-      content = `<strong>Start</strong><br>${vehicle.start_address}`;
-    } else if (pt.type === 'camp') {
-      icon    = makeIcon('⛳', GREEN, '#fff', 32);
-      content = `<strong>Camp</strong><br>${campAddr}`;
-    } else {
-      icon    = makeIcon(pt.label, GOLD, '#1a1018', 28);
-      content = `<strong>Stop ${pt.label}</strong><br>${pt.address}<br><em>${pt.riders}</em>`;
-    }
-    const marker = new google.maps.Marker({position: {lat: pt.lat, lng: pt.lng}, map, icon});
+    let pinEl, popupContent;
+    const size = pt.type === 'start' || pt.type === 'camp' ? 32 : 28;
+    const bg   = pt.type === 'start' ? BRAND : pt.type === 'camp' ? GREEN : GOLD;
+    const fg   = pt.type === 'camp' || pt.type === 'start' ? '#fff' : '#1a1018';
+    const lbl  = pt.type === 'start' ? '▶' : pt.type === 'camp' ? '⛳' : pt.label;
+
+    pinEl = document.createElement('div');
+    pinEl.style.cssText = `width:${size}px;height:${size}px;background:${bg};border:2px solid #fff;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:${size<=28?'11':'13'}px;font-weight:700;color:${fg};font-family:Arial;box-shadow:0 2px 6px rgba(0,0,0,.3);cursor:pointer`;
+    pinEl.textContent = lbl;
+
+    popupContent = pt.type === 'start'
+      ? `<strong>Start</strong><br>${vehicle.start_address}`
+      : pt.type === 'camp'
+      ? `<strong>Camp</strong><br>${campAddr}`
+      : `<strong>Stop ${pt.label}</strong><br>${pt.address}<br><em>${pt.riders}</em>`;
+
+    const marker = new AdvancedMarkerElement({
+      position: {lat: pt.lat, lng: pt.lng},
+      map,
+      content: pinEl,
+    });
     marker.addListener('click', () => {
-      infoWindow.setContent(content);
+      infoWindow.setContent(popupContent);
       infoWindow.open(map, marker);
     });
   });
