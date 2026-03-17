@@ -1658,7 +1658,6 @@ async function recalculateRoutes() {
 // ── Reassignment logic ─────────────────────────────────────────────────────
 
 // In-memory editable copy of route data
-let editableRoutes = null;
 let unassignedRiders = [];  // [{name, fromVehicle, stopAddress, lat, lon}]
 
 function initEditableRoutes(vehicles) {
