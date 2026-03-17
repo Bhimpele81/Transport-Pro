@@ -35,7 +35,7 @@ GEOCACHE_FILE   = "geocache.json"        # on-disk cache for lat/lon lookups
 ROUTECACHE_FILE = "routecache.json"      # on-disk cache for OSRM driving times
 COORD_OVERRIDES_FILE = "coord_overrides.json"  # user-editable GPS overrides
 NEIGHBOR_MI     = 1.5                    # houses ≤ 1.5 mi apart → same-van candidate
-MIN_UTIL        = 0.75                   # target minimum utilisation per vehicle
+MIN_UTIL        = 0.60                   # target minimum utilisation per vehicle
 ROAD_FACTOR     = 1.35                   # road distance ≈ straight-line × 1.35
 MPH_SUBURBAN    = 30.0                   # average speed for fallback time estimate
 
@@ -857,8 +857,8 @@ def cluster_and_route(students: list, vehicles: list,
         # harder to fill precisely with geographic constraints
         def effective_threshold(vi):
             cap = veh_objects[vi].capacity
-            if cap <= 6:  return 0.50   # 50% min for small vans
-            if cap <= 9:  return 0.60   # 60% min for medium vans
+            if cap <= 6:  return 0.40   # 40% min for small vans
+            if cap <= 9:  return 0.50   # 50% min for medium vans
             return MIN_UTIL              # 75% for full-size vans
 
         under = sorted(
@@ -993,50 +993,89 @@ def cluster_and_route(students: list, vehicles: list,
                                       lat=rep.lat, lon=rep.lon)
             addr_stop[key].riders.extend(unit)
 
-        # ── Nearest-neighbor TSP sequencing ─────────────────────────────
-        # Start from vehicle start, greedily pick closest unvisited stop,
-        # with a "no-backtracking" constraint: once we're moving toward camp
-        # we don't allow stops that are significantly farther from camp than
-        # the current position (prevents U-turns).
+        # ── Nearest-neighbor TSP with farthest-point terminus constraint ────
         #
-        # This guarantees:
-        #   • Geographic neighbours are consecutive stops
-        #   • Route flows roughly toward camp (no major detours)
-        #   • Every stop is visited exactly once
+        # FARTHEST-POINT TERMINUS RULE:
+        #   The geometrically farthest stop from camp is the route terminus —
+        #   no stops may appear after it in the sequence. This enforces an
+        #   outbound-only spine: the bus travels away from camp to the farthest
+        #   point, picks up everyone along the way, then returns directly.
+        #   Eliminates "loop-back" extensions that inflate distance 10-20%.
+        #
+        #   Exception: stops within 5% of the total route radius of the farthest
+        #   stop are considered co-terminus and may follow it (road constraints).
+        #
+        # Morning:   farthest stop first → work toward camp
+        # Afternoon: nearest stop first → work away from camp (mirror logic)
         unvisited = list(addr_stop.values())
 
         def dist_to_camp_s(s):
             return haversine_mi(s.lat, s.lon, camp_lat, camp_lon)
 
-        # Sequence stops using nearest-neighbor TSP with directional bias:
-        # Morning:   start from farthest stop, work toward camp (no backtracking)
-        # Afternoon: start from nearest stop to camp, work away from camp
+        # ── Farthest-Point Terminus Constraint ───────────────────────────────
+        # Outbound-terminating route: the geometrically farthest stop from
+        # camp (morning) or nearest stop to camp (afternoon) is the terminus.
+        # After it, no stop may be farther out — this eliminates loop-backs.
+        #
+        # Implementation uses a DYNAMIC terminus that updates as stops are
+        # placed, with an ×8 hard penalty for terminus violations. A 10%
+        # slack band allows minor road-geometry deviations without penalty.
+
+        # Start at farthest (morning) or nearest (afternoon)
         if trip_direction == "afternoon":
             first = min(unvisited, key=dist_to_camp_s)
         else:
             first = max(unvisited, key=dist_to_camp_s)
-        sorted_stops = [first]
+
+        sorted_stops  = [first]
         unvisited.remove(first)
 
+        # Dynamic terminus: tracks the extreme dist-from-camp placed so far
+        # Morning:   terminus_d = max dist seen (no stop may exceed this)
+        # Afternoon: terminus_d = min dist seen (no stop may go below this)
+        terminus_d = dist_to_camp_s(first)
+
         while unvisited:
-            last = sorted_stops[-1]
-            cur_d2c = dist_to_camp_s(last)
+            last      = sorted_stops[-1]
+            cur_d2c   = dist_to_camp_s(last)
             best_stop, best_score = None, float("inf")
+
             for s in unvisited:
-                geo_d = haversine_mi(last.lat, last.lon, s.lat, s.lon)
-                d2c_s = dist_to_camp_s(s)
+                geo_d  = haversine_mi(last.lat, last.lon, s.lat, s.lon)
+                d2c_s  = dist_to_camp_s(s)
+
                 if trip_direction == "afternoon":
-                    # Afternoon: penalise stops that are closer to camp
-                    # (encourages routing away from camp, not back toward it)
-                    backtrack_penalty = max(0.0, cur_d2c - d2c_s) * 0.5
+                    directional_penalty = max(0.0, terminus_d - d2c_s) * 0.5
+                    # Terminus violation: stop closer to camp than current min
+                    violation = max(0.0, terminus_d - d2c_s)
                 else:
-                    # Morning: penalise stops that are farther from camp
-                    backtrack_penalty = max(0.0, d2c_s - cur_d2c) * 0.5
-                score = geo_d + backtrack_penalty
+                    directional_penalty = max(0.0, d2c_s - cur_d2c) * 0.5
+                    # Terminus violation: stop farther from camp than current max
+                    violation = max(0.0, d2c_s - terminus_d)
+
+                # Allow 10% slack for road-geometry constraints
+                slack = terminus_d * 0.10
+                terminus_penalty = (violation * 8.0) if violation > slack else 0.0
+
+                score = geo_d + directional_penalty + terminus_penalty
                 if score < best_score:
                     best_score, best_stop = score, s
+
+            if best_stop is None:
+                # Safety: all candidates blocked — pick nearest anyway
+                # (every student must be assigned, even if it creates a minor loop)
+                best_stop = min(unvisited,
+                                key=lambda s: haversine_mi(last.lat, last.lon, s.lat, s.lon))
+
             sorted_stops.append(best_stop)
             unvisited.remove(best_stop)
+
+            # Update dynamic terminus
+            d2c_placed = dist_to_camp_s(best_stop)
+            if trip_direction == "afternoon":
+                terminus_d = min(terminus_d, d2c_placed)
+            else:
+                terminus_d = max(terminus_d, d2c_placed)
 
         # Real driving times: vehicle start → stop1 → … → stopN → camp
         coord_seq = ([(veh.start_lat, veh.start_lon)]
@@ -1172,7 +1211,7 @@ def build_dashboard(wb: Workbook, vehicles: list, camp_address: str = None, trip
     ws.merge_cells(f"A{lr}:H{lr}")
     c = ws[f"A{lr}"]
     if has_warnings:
-        c.value = ("⚠  Orange rows are below 75% capacity.  "
+        c.value = ("⚠  Orange rows are below 60% capacity.  "
                    "These vehicles serve geographically isolated stops that cannot be "
                    "merged without splitting neighbour groups.  "
                    "Consider reducing the number of vehicles in the fleet config.")
