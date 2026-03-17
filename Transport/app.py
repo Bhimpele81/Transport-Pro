@@ -1168,7 +1168,7 @@ function buildResultsTab(vehicles, jobId, initEditable=true) {
         </div>
         <div class="edit-bar">
           <button class="recalc-btn" id="recalc-${v.name.replace(/\s+/g,'-')}"
-                  onclick="recalculateRoutes()" disabled>
+                  onclick="recalculate()" disabled>
             ↻ Recalculate Routes
           </button>
           <span class="edit-hint">Click ✕ on a rider to remove them from this route</span>
@@ -1185,7 +1185,7 @@ function buildResultsTab(vehicles, jobId, initEditable=true) {
               <td class="stop-addr" colspan="2">${v.start_address}<div class="stop-city">Departure point</div></td>
               <td class="stop-time">—</td>
             </tr>
-            ${v.stops.map(s => {
+            ${v.stops.map((s, si) => {
               const addrParts = s.address.split(',');
               const street = addrParts[0] || s.address;
               const cityState = addrParts.slice(1).join(',').trim();
@@ -1193,7 +1193,7 @@ function buildResultsTab(vehicles, jobId, initEditable=true) {
                 .filter(r => r.trim())
                 .map(r => `<span class="rider-pill" data-rider="${r}" data-vehicle="${v.name}" data-address="${s.address}">
                   ${r}
-                  <button class="rider-remove" title="Remove ${r}" onclick="removeRider(this, '${r}', '${v.name}', '${s.address}')">✕</button>
+                  <button class="rider-remove" title="Remove ${r}" onclick="removeRider(this, '${v.name}', ${si}, '${r}')">✕</button>
                 </span>`).join('');
               return `<tr data-address="${s.address}" data-vehicle="${v.name}">
                 <td class="stop-num">${s.stop_num}</td>
@@ -1396,268 +1396,6 @@ function initEditableRoutes(vehicles) {
   hasEdits = false;
 }
 
-function removeRider(btn, riderName, vehicleName, stopAddress) {
-  if (!editableRoutes) {
-    console.warn('editableRoutes not initialized');
-    return;
-  }
-
-  // Find vehicle and stop in editableRoutes
-  const veh = editableRoutes.find(v => v.name === vehicleName);
-  if (!veh) return;
-  const stop = veh.stops.find(s => s.address === stopAddress);
-  if (!stop) return;
-
-  // Remove rider from stop
-  const riders = stop.rider_names.split(', ').filter(r => r.trim() && r !== riderName);
-  stop.rider_names = riders.join(', ');
-  stop.rider_count = riders.length;
-
-  // Remove the pill from DOM
-  const pill = btn.closest('.rider-pill');
-  pill.remove();
-
-  // Update rider count label
-  const row = btn.closest('tr');
-  const countEl = row.querySelector('.stop-rider-count');
-  if (countEl) countEl.textContent = `${riders.length} rider${riders.length !== 1 ? 's' : ''}`;
-
-  // If stop is now empty, remove the row
-  if (riders.length === 0) {
-    veh.stops = veh.stops.filter(s => s.address !== stopAddress);
-    row.remove();
-  }
-
-  // Add to unassigned tray — pass coords and address so reassignment works
-  addToUnassignedTray(riderName, vehicleName, stopAddress, stop.lat, stop.lon);
-
-  // Update vehicle header stats
-  updateVehicleHeader(vehicleName);
-
-  // Enable recalculate button
-  hasEdits = true;
-  document.querySelectorAll('.recalc-btn').forEach(b => b.disabled = false);
-}
-
-function addToUnassignedTray(riderName, fromVehicle, address, lat, lon) {
-  const tray = document.getElementById('unassigned-tray');
-  const list = document.getElementById('unassigned-list');
-  tray.style.display = 'block';
-
-  const vehicleOptions = editableRoutes
-    .map(v => `<option value="${v.name}" ${v.name === fromVehicle ? 'disabled' : ''}>${v.name}</option>`)
-    .join('');
-
-  const pill = document.createElement('div');
-  pill.className = 'unassigned-pill';
-  pill.dataset.rider   = riderName;
-  pill.dataset.address = address || '';
-  pill.dataset.lat     = lat || 0;
-  pill.dataset.lon     = lon || 0;
-  pill.innerHTML = `
-    <span>${riderName}</span>
-    <span style="font-size:.7rem;opacity:.7">from ${fromVehicle}</span>
-    <select title="Assign to vehicle">
-      <option value="">Assign to...</option>
-      ${vehicleOptions}
-    </select>
-    <button class="assign-btn" onclick="assignRider(this, '${riderName}')">→</button>
-  `;
-  list.appendChild(pill);
-}
-
-function assignRider(btn, riderName) {
-  const pill = btn.closest('.unassigned-pill');
-  const select = pill.querySelector('select');
-  const targetVehicleName = select.value;
-  if (!targetVehicleName) { alert('Please select a vehicle first'); return; }
-
-  const targetVeh = editableRoutes.find(v => v.name === targetVehicleName);
-  if (!targetVeh) return;
-
-  // Check capacity
-  const currentRiders = targetVeh.stops.reduce((s, st) => s + st.rider_count, 0);
-  if (currentRiders >= targetVeh.capacity) {
-    alert(`${targetVehicleName} is already at full capacity (${targetVeh.capacity} riders)`);
-    return;
-  }
-
-  // Find if there's already a stop for this rider's address, or add new
-  // For simplicity, we need to know the address — store it on the pill
-  // Since we don't have the address here, add as a new stop with a placeholder
-  // The recalculate will handle resequencing
-  const existingStops = targetVeh.stops;
-
-  // Add rider to a new stop (address lookup happens on recalculate)
-  // For now, find if there's a stop we can append to by checking the unassigned pill's origin data
-  // Check if target vehicle already has a stop at this address
-  const riderAddr = pill.dataset.address || '';
-  const existingStop = riderAddr ? targetVeh.stops.find(s => s.address === riderAddr) : null;
-
-  if (existingStop) {
-    // Add rider to existing stop at same address
-    const riders = existingStop.rider_names ? existingStop.rider_names.split(', ') : [];
-    riders.push(riderName);
-    existingStop.rider_names = riders.join(', ');
-    existingStop.rider_count = riders.length;
-  } else {
-    // Create new stop
-    const newStop = {
-      address:      riderAddr || '(address unknown)',
-      rider_names:  riderName,
-      rider_count:  1,
-      drive_time:   '—',
-      lat:          pill.dataset.lat ? parseFloat(pill.dataset.lat) : 0,
-      lon:          pill.dataset.lon ? parseFloat(pill.dataset.lon) : 0,
-      stop_num:     existingStops.length + 1,
-    };
-    targetVeh.stops.push(newStop);
-  }
-  // Remove the fake newStop push below
-
-  // Remove from tray
-  pill.remove();
-  const list = document.getElementById('unassigned-list');
-  if (!list.children.length) {
-    document.getElementById('unassigned-tray').style.display = 'none';
-  }
-
-  // Update header
-  updateVehicleHeader(targetVehicleName);
-
-  // Rebuild that vehicle's stop table in DOM
-  rebuildStopTable(targetVehicleName);
-
-  hasEdits = true;
-  document.querySelectorAll('.recalc-btn').forEach(b => b.disabled = false);
-}
-
-function updateVehicleHeader(vehicleName) {
-  // Update rider count in the vehicle header
-  const veh = editableRoutes.find(v => v.name === vehicleName);
-  if (!veh) return;
-  const totalRiders = veh.stops.reduce((s, st) => s + st.rider_count, 0);
-  // Find the card and update stats
-  document.querySelectorAll('.veh-card').forEach(card => {
-    const nameEl = card.querySelector('.veh-name');
-    if (nameEl && nameEl.textContent === vehicleName) {
-      const statEl = card.querySelector('.veh-stat');
-      if (statEl) statEl.innerHTML = `<strong>${totalRiders}</strong>/${veh.capacity} riders`;
-    }
-  });
-}
-
-function rebuildStopTable(vehicleName) {
-  // Rebuild stop rows for a vehicle after assignment
-  const veh = editableRoutes.find(v => v.name === vehicleName);
-  if (!veh) return;
-  const tableId = `stop-table-${vehicleName.replace(/\s+/g, '-')}`;
-  const table = document.getElementById(tableId);
-  if (!table) return;
-  const tbody = table.querySelector('tbody');
-  if (!tbody) return;
-
-  // Rebuild stop rows (keep start and arrive rows)
-  const rows = Array.from(tbody.querySelectorAll('tr'));
-  const startRow  = rows.find(r => r.classList.contains('stop-row-start'));
-  const arriveRow = rows.find(r => r.classList.contains('stop-row-arrive'));
-
-  tbody.innerHTML = '';
-  if (startRow)  tbody.appendChild(startRow);
-  veh.stops.forEach((s, i) => {
-    const addrParts = s.address.split(',');
-    const street = addrParts[0] || s.address;
-    const cityState = addrParts.slice(1).join(',').trim();
-    const pills = s.rider_names.split(', ').filter(r => r.trim())
-      .map(r => `<span class="rider-pill" data-rider="${r}">
-        ${r}
-        <button class="rider-remove" onclick="removeRider(this, '${r}', '${vehicleName}', '${s.address}')">✕</button>
-      </span>`).join('');
-    const tr = document.createElement('tr');
-    tr.dataset.address = s.address;
-    tr.dataset.vehicle = vehicleName;
-    tr.innerHTML = `
-      <td class="stop-num">${i+1}</td>
-      <td class="stop-addr">${street}<div class="stop-city">${cityState}</div></td>
-      <td class="stop-riders">${pills}<br><span class="stop-rider-count" style="font-size:.7rem;color:#aaa">${s.rider_count} rider${s.rider_count !== 1 ? 's' : ''}</span></td>
-      <td class="stop-time">${s.drive_time}</td>
-    `;
-    tbody.appendChild(tr);
-  });
-  if (arriveRow) tbody.appendChild(arriveRow);
-}
-
-async function recalculateRoutes() {
-  if (!editableRoutes || !currentJobId) return;
-
-  // Store rider addresses on unassigned pills before sending
-  document.querySelectorAll('.unassigned-pill').forEach(pill => {
-    const riderName = pill.dataset.rider;
-    // Try to find the address from original routeData
-    if (routeData) {
-      for (const v of routeData) {
-        for (const s of v.stops) {
-          if (s.rider_names.split(', ').includes(riderName)) {
-            pill.dataset.address = s.address;
-            pill.dataset.lat = s.lat;
-            pill.dataset.lon = s.lon;
-          }
-        }
-      }
-    }
-  });
-
-  document.querySelectorAll('.recalc-btn').forEach(b => {
-    b.disabled = true;
-    b.textContent = '↻ Recalculating…';
-  });
-
-  try {
-    const resp = await fetch(`/api/recalculate/${currentJobId}`, {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({vehicles: editableRoutes}),
-    });
-    const data = await resp.json();
-
-    if (data.error) {
-      alert('Recalculation error: ' + data.error);
-      return;
-    }
-
-    // Update routes with recalculated data
-    routeData = data.route_data;
-    editableRoutes = JSON.parse(JSON.stringify(routeData));
-    hasEdits = false;
-
-    // Rebuild the entire results tab with fresh data
-    buildResultsTab(routeData, currentJobId);
-    initEditableRoutes(routeData);
-
-    // Save updated results to localStorage
-    try {
-      const campAddr = document.getElementById('camp-address').value.trim();
-      localStorage.setItem('elbow_last_routes', JSON.stringify({
-        vehicles: routeData,
-        savedAt:  new Date().toLocaleDateString('en-US', {month:'short',day:'numeric',year:'numeric',hour:'numeric',minute:'2-digit'}),
-        tripDir:  tripDirection,
-        campAddr: campAddr,
-      }));
-    } catch(e) {}
-
-  } catch(err) {
-    alert('Network error: ' + err.message);
-  } finally {
-    document.querySelectorAll('.recalc-btn').forEach(b => {
-      b.disabled = false;
-      b.textContent = '↻ Recalculate Routes';
-    });
-  }
-}
-
-// ── Reassignment logic ─────────────────────────────────────────────────────
-
-// In-memory editable copy of route data
 let unassignedRiders = [];  // [{name, fromVehicle, stopAddress, lat, lon}]
 
 
@@ -1780,7 +1518,7 @@ async function recalculate() {
   btn.textContent = 'Recalculating…';
 
   try {
-    const resp = await fetch(`/api/reassign/${currentJobId}`, {
+    const resp = await fetch(`/api/recalculate/${currentJobId}`, {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({vehicles: editableRoutes}),
