@@ -743,6 +743,10 @@ def cluster_and_route(students: list, vehicles: list,
     if progress_cb:
         ok = sum(1 for s in students if s.geocoded)
         progress_cb(f"Geocoded {ok}/{len(students)} addresses")
+        # Flag any addresses that fell back to camp coords
+        bad = [s for s in students if not s.geocoded]
+        for s in bad[:5]:
+            progress_cb(f"  ⚠ Could not geocode: {s.full_address}")
 
     # ── 2. Group by exact address (families) ──────────────────────────────
     addr_map: dict = {}
@@ -992,6 +996,13 @@ def cluster_and_route(students: list, vehicles: list,
                 addr_stop[key] = Stop(address=rep.full_address,
                                       lat=rep.lat, lon=rep.lon)
             addr_stop[key].riders.extend(unit)
+
+        # Log any stops with zero coordinates
+        if progress_cb:
+            zero_stops = [s for s in addr_stop.values() if abs(s.lat) < 0.001]
+            if zero_stops:
+                for zs in zero_stops:
+                    progress_cb(f"  ⚠ Stop has no coordinates: {zs.address}")
 
         # ── Nearest-neighbor TSP with farthest-point terminus constraint ────
         #
