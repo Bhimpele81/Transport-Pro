@@ -13,4 +13,4 @@ cp Transport/bus_route_optimizer.py .
 echo "Restarting app..."
 fuser -k 5000/tcp 2>/dev/null || true
 sleep 1
-python app.py
+python3 app.py
