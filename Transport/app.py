@@ -1283,7 +1283,7 @@ function loadGoogleMapsAPI() {
   if (googleMapsLoaded || googleMapsLoading) return;
   googleMapsLoading = true;
   const script = document.createElement('script');
-  script.src = `https://maps.googleapis.com/maps/api/js?key=${window.GOOGLE_MAPS_KEY}&libraries=geometry,marker,routes&callback=onGoogleMapsLoaded&v=beta`;
+  script.src = `https://maps.googleapis.com/maps/api/js?key=${window.GOOGLE_MAPS_KEY}&libraries=geometry,marker&callback=onGoogleMapsLoaded&v=beta`;
   script.async = true;
   document.head.appendChild(script);
 }
@@ -1366,6 +1366,9 @@ async function renderGoogleMap(el, mapId, allPoints, vehicle, campAddr) {
               Math.cos(a.lat*Math.PI/180) * Math.cos(b.lat*Math.PI/180) * Math.sin(dLng/2)**2;
     return R * 2 * Math.atan2(Math.sqrt(x), Math.sqrt(1-x));
   }
+
+  // Load AdvancedMarkerElement
+  const { AdvancedMarkerElement } = await google.maps.importLibrary("marker");
 
   // Draw markers on top of route line
   function drawMarkers() {
