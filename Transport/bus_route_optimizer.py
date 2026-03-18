@@ -812,11 +812,27 @@ def cluster_and_route(students: list, vehicles: list,
     assignments = [[] for _ in veh_objects]
     counts      = [0]  * len(veh_objects)
 
+    # Maximum distance from vehicle start OR existing stops for initial assignment
+    MAX_INITIAL_MI = 18.0  # hard cap — prevents cross-county mixing
+
     def score_cluster(cl, vi) -> float:
         remaining = veh_objects[vi].capacity - counts[vi]
         if remaining < cl_size(cl): return float("inf")
         clat, clon = centroid(cl)
-        geo = haversine_mi(clat, clon, veh_objects[vi].start_lat, veh_objects[vi].start_lon)
+        # Distance from vehicle start
+        d_start = haversine_mi(clat, clon,
+                               veh_objects[vi].start_lat, veh_objects[vi].start_lon)
+        # If vehicle already has stops, also check distance from existing centroid
+        if assignments[vi]:
+            exist_lat = sum(uc(u)[0] for u in assignments[vi]) / len(assignments[vi])
+            exist_lon = sum(uc(u)[1] for u in assignments[vi]) / len(assignments[vi])
+            d_existing = haversine_mi(clat, clon, exist_lat, exist_lon)
+            # Hard reject: cluster too far from existing stops on this vehicle
+            if d_existing > MAX_INITIAL_MI: return float("inf")
+            geo = min(d_start, d_existing)
+        else:
+            if d_start > MAX_INITIAL_MI: return float("inf")
+            geo = d_start
         # Bonus for filling small vehicles — reduces their likelihood of ending up empty
         cap = veh_objects[vi].capacity
         small_bonus = 3.0 if cap <= 6 else (1.5 if cap <= 9 else 0.0)
@@ -833,6 +849,37 @@ def cluster_and_route(students: list, vehicles: list,
             counts[best] += cl_size(cl)
         else:
             leftover.extend(cl)   # individual units if cluster won't fit
+
+    # For leftover units, enforce geographic cap too
+    for unit in sorted(leftover, key=d2c, reverse=True):
+        sz = len(unit)
+        ulat, ulon = uc(unit)
+        candidates = []
+        for vi in range(len(veh_objects)):
+            if veh_objects[vi].capacity - counts[vi] < sz: continue
+            d_start = haversine_mi(ulat, ulon,
+                                   veh_objects[vi].start_lat, veh_objects[vi].start_lon)
+            if assignments[vi]:
+                exist_lat = sum(uc(u)[0] for u in assignments[vi]) / len(assignments[vi])
+                exist_lon = sum(uc(u)[1] for u in assignments[vi]) / len(assignments[vi])
+                d_exist = haversine_mi(ulat, ulon, exist_lat, exist_lon)
+                if d_exist > MAX_INITIAL_MI: continue
+                candidates.append((min(d_start, d_exist), vi))
+            else:
+                if d_start > MAX_INITIAL_MI: continue
+                candidates.append((d_start, vi))
+        if candidates:
+            vi = min(candidates)[1]
+        else:
+            # No vehicle within cap — relax and use nearest by start
+            vi = min(range(len(veh_objects)),
+                     key=lambda i: haversine_mi(ulat, ulon,
+                                                veh_objects[i].start_lat,
+                                                veh_objects[i].start_lon)
+                     if veh_objects[i].capacity - counts[i] >= sz
+                     else float("inf"))
+        assignments[vi].append(unit)
+        counts[vi] += sz
 
     for unit in sorted(leftover, key=d2c, reverse=True):
         sz = len(unit)
@@ -894,7 +941,9 @@ def cluster_and_route(students: list, vehicles: list,
             d = haversine_mi(src_lat, src_lon, dlat, dlon)
             if d < full_dist: full_dist, full_dest = d, vi_dst
 
-        if full_dest is not None:
+        # Only allow full merge if destination is geographically close
+        MAX_MERGE_MI = 5.0
+        if full_dest is not None and full_dist <= MAX_MERGE_MI:
             for u in units_src: assignments[full_dest].append(u)
             counts[full_dest] += total_src
             assignments[vi_src] = []; counts[vi_src] = 0
@@ -939,7 +988,7 @@ def cluster_and_route(students: list, vehicles: list,
             
             # Max distance a group can be scattered — prevents mixing
             # students from completely different geographic areas
-            MAX_SCATTER_MI = 5.0
+            MAX_SCATTER_MI = 2.5
 
             best_vi, best_d = None, float("inf")
             for vi_dst in range(len(veh_objects)):
@@ -1094,17 +1143,9 @@ def cluster_and_route(students: list, vehicles: list,
                      + [(camp_lat, camp_lon)])
         legs = route_leg_times(coord_seq, progress_cb)
 
-        # legs[0]   = garage → stop1      (not shown per-stop)
-        # legs[1]   = stop1  → stop2
-        # legs[i+1] = stop(i) → stop(i+1)
-        # legs[-1]  = lastStop → camp
-        # Display: each stop shows time from PREVIOUS stop (or "first pickup" for stop 1)
         for i, stop in enumerate(sorted_stops):
-            mins = max(1, round(legs[i + 1]) if i + 1 < len(legs) else 1)
-            if i == 0:
-                stop.drive_time = f"{max(1, round(legs[0]))} min from garage"
-            else:
-                stop.drive_time = f"{mins} min"
+            mins = max(1, round(legs[i]))
+            stop.drive_time = f"{mins} min from start" if i == 0 else f"{mins} min"
 
         veh.stops    = sorted_stops
         veh.camp_lat = camp_lat
