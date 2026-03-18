@@ -1354,136 +1354,73 @@ async function renderGoogleMap(el, mapId, allPoints, vehicle, campAddr) {
     mapTypeId: 'roadmap',
   });
 
-  function makeIcon(label, bg, fg, size) {
-    return {
-      url: `data:image/svg+xml;charset=UTF-8,${encodeURIComponent(
-        `<svg xmlns="http://www.w3.org/2000/svg" width="${size}" height="${size}">
-          <circle cx="${size/2}" cy="${size/2}" r="${size/2-1}" fill="${bg}" stroke="white" stroke-width="2"/>
-          <text x="${size/2}" y="${size/2+4}" text-anchor="middle" font-size="${size<=30?11:13}"
-            font-weight="700" fill="${fg}" font-family="Arial">${label}</text>
-        </svg>`
-      )}`,
-      scaledSize: new google.maps.Size(size, size),
-      anchor: new google.maps.Point(size/2, size/2),
-    };
-  }
-
   const infoWindow = new google.maps.InfoWindow();
-
-  const { AdvancedMarkerElement } = await google.maps.importLibrary("marker");
-
-  // Offset overlapping markers slightly so they don't stack on top of each other
-  const OFFSET = 0.0002; // ~20 meters
-  const usedPositions = [];
-  allPoints.forEach(pt => {
-    let lat = pt.lat, lng = pt.lng;
-    let attempts = 0;
-    while (usedPositions.some(p => Math.abs(p.lat - lat) < OFFSET && Math.abs(p.lng - lng) < OFFSET) && attempts < 8) {
-      const angle = attempts * (Math.PI / 4);
-      lat = pt.lat + OFFSET * Math.cos(angle);
-      lng = pt.lng + OFFSET * Math.sin(angle);
-      attempts++;
-    }
-    pt._lat = lat; pt._lng = lng;
-    usedPositions.push({lat, lng});
-  });
-
-  allPoints.forEach((pt, i) => {
-    let pinEl, popupContent;
-    const size = pt.type === 'start' || pt.type === 'camp' ? 32 : 28;
-    const bg   = pt.type === 'start' ? BRAND : pt.type === 'camp' ? GREEN : GOLD;
-    const fg   = pt.type === 'camp' || pt.type === 'start' ? '#fff' : '#1a1018';
-    const lbl  = pt.type === 'start' ? '▶' : pt.type === 'camp' ? '⛳' : pt.label;
-
-    pinEl = document.createElement('div');
-    pinEl.style.cssText = `width:${size}px;height:${size}px;background:${bg};border:2px solid #fff;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:${size<=28?'11':'13'}px;font-weight:700;color:${fg};font-family:Arial;box-shadow:0 2px 6px rgba(0,0,0,.3);cursor:pointer`;
-    pinEl.textContent = lbl;
-
-    popupContent = pt.type === 'start'
-      ? `<strong>Start</strong><br>${vehicle.start_address}`
-      : pt.type === 'camp'
-      ? `<strong>Camp</strong><br>${campAddr}`
-      : `<strong>Stop ${pt.label}</strong><br>${pt.address}<br><em>${pt.riders}</em>`;
-
-    const marker = new AdvancedMarkerElement({
-      position: {lat: pt._lat || pt.lat, lng: pt._lng || pt.lng},
-      map,
-      content: pinEl,
-    });
-    marker.addListener('click', () => {
-      infoWindow.setContent(popupContent);
-      infoWindow.open(map, marker);
-    });
-  });
-
-  // Draw route with Google Directions Service
   const bounds = new google.maps.LatLngBounds();
   allPoints.forEach(p => bounds.extend({lat: p.lat, lng: p.lng}));
 
-  // Build encoded waypoints string for Routes API
-  // Routes API supports up to 25 waypoints per request
-  const origin = allPoints[0];
-  const destination = allPoints[allPoints.length - 1];
-  const intermediates = allPoints.slice(1, -1);
+  function distMeters(a, b) {
+    const R = 6371000;
+    const dLat = (b.lat - a.lat) * Math.PI / 180;
+    const dLng = (b.lng - a.lng) * Math.PI / 180;
+    const x = Math.sin(dLat/2)**2 +
+              Math.cos(a.lat*Math.PI/180) * Math.cos(b.lat*Math.PI/180) * Math.sin(dLng/2)**2;
+    return R * 2 * Math.atan2(Math.sqrt(x), Math.sqrt(1-x));
+  }
 
-  // Use fetch with Routes API (replaces deprecated DirectionsService)
-  const routesUrl = `https://routes.googleapis.com/directions/v2:computeRoutes`;
-  
-  const requestBody = {
-    origin: {
-      location: { latLng: { latitude: origin.lat, longitude: origin.lng } }
-    },
-    destination: {
-      location: { latLng: { latitude: destination.lat, longitude: destination.lng } }
-    },
-    intermediates: intermediates.map(p => ({
-      location: { latLng: { latitude: p.lat, longitude: p.lng } }
-    })),
-    travelMode: "DRIVE",
-    routingPreference: "TRAFFIC_AWARE",
-    polylineEncoding: "GEO_JSON_WGS84",
-  };
-
-  try {
-    const resp = await fetch(routesUrl, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "X-Goog-Api-Key": window.GOOGLE_MAPS_KEY,
-        "X-Goog-FieldMask": "routes.polyline",
-      },
-      body: JSON.stringify(requestBody),
+  // Draw markers on top of route line
+  function drawMarkers() {
+    allPoints.forEach(pt => {
+      const size = pt.type === 'camp' ? 32 : 28;
+      const bg   = pt.type === 'camp' ? GREEN : GOLD;
+      const fg   = pt.type === 'camp' ? '#fff' : '#1a1018';
+      const lbl  = pt.type === 'camp' ? '⛳' : pt.label;
+      const pinEl = document.createElement('div');
+      pinEl.style.cssText = `width:${size}px;height:${size}px;background:${bg};border:2.5px solid #fff;` +
+        `border-radius:50%;display:flex;align-items:center;justify-content:center;` +
+        `font-size:${size<=28?'11':'13'}px;font-weight:700;color:${fg};font-family:Arial;` +
+        `box-shadow:0 2px 8px rgba(0,0,0,.5);cursor:pointer`;
+      pinEl.textContent = lbl;
+      const popup = pt.type === 'camp'
+        ? `<strong>Camp</strong><br>${campAddr}`
+        : `<strong>Stop ${pt.label}</strong><br>${pt.address}<br><em>${pt.riders}</em>`;
+      const m = new AdvancedMarkerElement({position:{lat:pt.lat,lng:pt.lng}, map, content:pinEl, zIndex:200});
+      m.addListener('click', () => { infoWindow.setContent(popup); infoWindow.open(map, m); });
     });
+    map.fitBounds(bounds, {top:40, right:40, bottom:40, left:40});
+  }
 
+  // Fetch road-following polyline from backend (server-side Google Directions API)
+  try {
+    const resp = await fetch('/api/route-polyline', {
+      method:  'POST',
+      headers: {'Content-Type': 'application/json'},
+      body:    JSON.stringify({points: allPoints.map(p => ({lat: p.lat, lng: p.lng}))}),
+    });
     const data = await resp.json();
-
-    if (data.routes && data.routes[0] && data.routes[0].polyline) {
-      const coords = data.routes[0].polyline.geoJsonLinestring.coordinates;
-      const path = coords.map(([lng, lat]) => ({lat, lng}));
+    if (data.errors) console.warn('Polyline errors:', data.errors);
+    if (data.coords && data.coords.length > 1) {
       new google.maps.Polyline({
-        path,
-        map,
-        strokeColor:   BRAND,
-        strokeWeight:  4,
-        strokeOpacity: .85,
+        path: data.coords, map,
+        strokeColor: BRAND, strokeWeight: 4, strokeOpacity: .85,
       });
     } else {
-      throw new Error("No route in response");
+      // Fallback: straight dashed line
+      new google.maps.Polyline({
+        path: allPoints.map(p => ({lat:p.lat, lng:p.lng})), map,
+        strokeColor: BRAND, strokeWeight: 3, strokeOpacity: .6,
+        icons: [{icon:{path:'M 0,-1 0,1',strokeOpacity:1,scale:3},offset:'0',repeat:'10px'}],
+      });
     }
   } catch(e) {
-    console.warn("Routes API failed, using polyline fallback:", e);
-    // Fallback: straight dashed polyline
+    console.warn('Route polyline failed:', e);
     new google.maps.Polyline({
-      path:          allPoints.map(p => ({lat: p.lat, lng: p.lng})),
-      map,
-      strokeColor:   BRAND,
-      strokeWeight:  3,
-      strokeOpacity: .6,
-      icons: [{icon:{path:'M 0,-1 0,1',strokeOpacity:1,scale:3},offset:'0',repeat:'12px'}],
+      path: allPoints.map(p => ({lat:p.lat, lng:p.lng})), map,
+      strokeColor: BRAND, strokeWeight: 3, strokeOpacity: .6,
+      icons: [{icon:{path:'M 0,-1 0,1',strokeOpacity:1,scale:3},offset:'0',repeat:'10px'}],
     });
   }
 
-  map.fitBounds(bounds, {top: 40, right: 40, bottom: 40, left: 40});
+  drawMarkers();
 }
 
 // ── Manual editing ─────────────────────────────────────────────────────────
