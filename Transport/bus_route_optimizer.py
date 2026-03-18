@@ -1094,9 +1094,17 @@ def cluster_and_route(students: list, vehicles: list,
                      + [(camp_lat, camp_lon)])
         legs = route_leg_times(coord_seq, progress_cb)
 
+        # legs[0]   = garage → stop1      (not shown per-stop)
+        # legs[1]   = stop1  → stop2
+        # legs[i+1] = stop(i) → stop(i+1)
+        # legs[-1]  = lastStop → camp
+        # Display: each stop shows time from PREVIOUS stop (or "first pickup" for stop 1)
         for i, stop in enumerate(sorted_stops):
-            mins = max(1, round(legs[i]))
-            stop.drive_time = f"{mins} min from start" if i == 0 else f"{mins} min"
+            mins = max(1, round(legs[i + 1]) if i + 1 < len(legs) else 1)
+            if i == 0:
+                stop.drive_time = f"{max(1, round(legs[0]))} min from garage"
+            else:
+                stop.drive_time = f"{mins} min"
 
         veh.stops    = sorted_stops
         veh.camp_lat = camp_lat
