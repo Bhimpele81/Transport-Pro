@@ -812,34 +812,52 @@ def cluster_and_route(students: list, vehicles: list,
     assignments = [[] for _ in veh_objects]
     counts      = [0]  * len(veh_objects)
 
-    # Maximum distance from vehicle start OR existing stops for initial assignment
-    MAX_INITIAL_MI = 18.0  # hard cap — prevents cross-county mixing
+    # Hard cap: cluster must be within this distance of vehicle start
+    # OR within this distance of vehicle's existing stops centroid
+    MAX_INITIAL_MI = 15.0
 
     def score_cluster(cl, vi) -> float:
         remaining = veh_objects[vi].capacity - counts[vi]
         if remaining < cl_size(cl): return float("inf")
         clat, clon = centroid(cl)
-        # Distance from vehicle start
+
+        # Distance from vehicle START — primary geographic anchor
         d_start = haversine_mi(clat, clon,
                                veh_objects[vi].start_lat, veh_objects[vi].start_lon)
-        # If vehicle already has stops, also check distance from existing centroid
+
+        # If vehicle already has stops, use existing centroid as secondary anchor
         if assignments[vi]:
-            exist_lat = sum(uc(u)[0] for u in assignments[vi]) / len(assignments[vi])
-            exist_lon = sum(uc(u)[1] for u in assignments[vi]) / len(assignments[vi])
+            exist_lats = [uc(u)[0] for u in assignments[vi]]
+            exist_lons = [uc(u)[1] for u in assignments[vi]]
+            exist_lat  = sum(exist_lats) / len(exist_lats)
+            exist_lon  = sum(exist_lons) / len(exist_lons)
             d_existing = haversine_mi(clat, clon, exist_lat, exist_lon)
-            # Hard reject: cluster too far from existing stops on this vehicle
-            if d_existing > MAX_INITIAL_MI: return float("inf")
+            # Hard reject if cluster is far from BOTH start AND existing stops
+            if d_start > MAX_INITIAL_MI and d_existing > MAX_INITIAL_MI:
+                return float("inf")
+            # Use the better of the two distances
             geo = min(d_start, d_existing)
         else:
-            if d_start > MAX_INITIAL_MI: return float("inf")
+            # Empty vehicle — hard reject if cluster too far from start
+            if d_start > MAX_INITIAL_MI:
+                return float("inf")
             geo = d_start
-        # Bonus for filling small vehicles — reduces their likelihood of ending up empty
+
+        # Small vehicle bonus
         cap = veh_objects[vi].capacity
         small_bonus = 3.0 if cap <= 6 else (1.5 if cap <= 9 else 0.0)
+
+        # Strong fill bonus — once a vehicle has students in an area, 
+        # strongly prefer adding nearby students to it
         fill_ratio = counts[vi] / cap if cap else 0
-        # Prefer vehicles that are partially filled (building on existing load)
-        fill_bonus = fill_ratio * 2.0
-        return geo - small_bonus - fill_bonus
+        fill_bonus = fill_ratio * 4.0  # increased from 2.0
+
+        # Proximity bonus: exponentially reward vehicles that are very close
+        # This prevents a central vehicle (like one starting at camp) from 
+        # stealing students from their natural regional vehicle
+        proximity_bonus = max(0, 8.0 - d_start)  # up to 8mi bonus for being close
+
+        return geo - small_bonus - fill_bonus - proximity_bonus
 
     leftover = []
     for cl in assignable:
