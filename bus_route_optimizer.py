@@ -6,18 +6,12 @@ Bus Route Optimizer - Elbow Lane Day Camp
   OpenStreetMap Nominatim as fallback
 * Clusters students by TRUE address-level proximity - ZIP codes ignored
 * Gets real driving times via Google Directions API (falls back to OSRM)
-* Assigns whole geographic clusters to vehicles (neighbors always same van)
+* Compass-aware clustering: stops in different compass directions from camp
+  are never assigned to the same vehicle (prevents Ambler+Chalfont zigzags)
 * Eliminates empty vehicles; warns about under-filled ones in spreadsheet
 * Outputs a formatted Excel workbook in Elbow Lane brand colors
 
 Dependencies: pip install openpyxl
-
-Usage (CLI):
-    python bus_route_optimizer.py --csv students.csv --vehicles fleet.txt
-
-Usage (import):
-    from bus_route_optimizer import generate_routes
-    generate_routes(csv_text, vehicles_text, "output.xlsx", progress_cb=print)
 """
 
 import argparse, csv, io, json, math, os, re, time, urllib.parse, urllib.request
@@ -40,9 +34,14 @@ MIN_UTIL      = 0.60
 ROAD_FACTOR   = 1.35
 MPH_SUBURBAN  = 30.0
 
-# How much farther from camp a stop can be vs current stop without being
-# considered a backtrack. Small slack handles road geometry cases.
-CAMP_DIRECTION_SLACK_MI = 0.5
+# Maximum angular spread (degrees) allowed between stops on the same vehicle.
+# Ambler is 217 deg (SW) from camp, Chalfont is 309 deg (NW) = 92 deg apart.
+# Setting this to 75 keeps directionally-incompatible stops off the same bus.
+MAX_BEARING_SPREAD_DEG = 75.0
+
+# Distance tier width for sequencing - stops within this range of each other
+# in distance-from-camp are grouped and sorted by nearest-neighbor
+TIER_WIDTH_MI = 1.0
 
 # -- Coordinate overrides -----------------------------------------------------
 def _load_overrides() -> dict:
@@ -70,7 +69,6 @@ def add_coord_override(address: str, lat: float, lon: float) -> None:
 BRAND_COLOR = "6D1F2F"
 BRAND_LIGHT = "F5E6E9"
 LIGHT_GRAY  = "F2F2F2"
-YELLOW_FILL = "FFEB9C"
 ORANGE_FILL = "FFD966"
 GREEN_FILL  = "E2EFDA"
 WHITE       = "FFFFFF"
@@ -138,6 +136,7 @@ class Vehicle:
     start_lon: float = 0.0
     camp_lat: float = 0.0
     camp_lon: float = 0.0
+    last_leg_mins: int = 0  # drive time from last stop to camp (Google Maps)
 
     @property
     def rider_count(self) -> int:
@@ -174,6 +173,32 @@ def haversine_mi(lat1, lon1, lat2, lon2) -> float:
     a = (math.sin(math.radians(lat2-lat1)/2)**2
          + math.cos(p1)*math.cos(p2)*math.sin(math.radians(lon2-lon1)/2)**2)
     return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1-a))
+
+def bearing_deg(from_lat, from_lon, to_lat, to_lon) -> float:
+    """Compass bearing in degrees (0=N, 90=E, 180=S, 270=W)."""
+    lat1 = math.radians(from_lat)
+    lat2 = math.radians(to_lat)
+    dlon = math.radians(to_lon - from_lon)
+    x = math.sin(dlon) * math.cos(lat2)
+    y = math.cos(lat1) * math.sin(lat2) - math.sin(lat1) * math.cos(lat2) * math.cos(dlon)
+    return (math.degrees(math.atan2(x, y)) + 360) % 360
+
+def _bearing_spread(bearings: list) -> float:
+    """Minimum arc in degrees that contains all bearings (0-360)."""
+    if len(bearings) <= 1:
+        return 0.0
+    sorted_b = sorted(bearings)
+    max_gap = 0.0
+    for i in range(len(sorted_b)):
+        gap = (sorted_b[(i+1) % len(sorted_b)] - sorted_b[i]) % 360
+        max_gap = max(max_gap, gap)
+    return 360.0 - max_gap
+
+def _bearing_compatible(existing: list, new_bearing: float) -> bool:
+    """True if adding new_bearing keeps total spread within MAX_BEARING_SPREAD_DEG."""
+    if not existing:
+        return True
+    return _bearing_spread(existing + [new_bearing]) <= MAX_BEARING_SPREAD_DEG
 
 def centroid(units: list) -> tuple:
     lats = [u[0].lat for u in units]
@@ -256,14 +281,11 @@ def driving_minutes(lat1, lon1, lat2, lon2, cache: dict) -> float:
 
 def route_leg_times(coord_seq: list, progress_cb=None) -> list:
     """
-    Returns driving minutes for each consecutive leg in coord_seq.
-
+    Returns driving minutes for each leg in coord_seq.
     coord_seq = [garage, stop1, stop2, ..., stopN, camp]
-    Returns list of length len(coord_seq)-1:
-      result[0]   = garage -> stop1  (deadhead)
-      result[1]   = stop1 -> stop2
-      result[i]   = stop(i-1) -> stop(i)  for i >= 1
-      result[N]   = stopN -> camp
+    result[0] = garage->stop1 (deadhead)
+    result[i] = stop(i-1)->stop(i) for i>=1
+    result[N] = stopN->camp
     """
     cache = _load_json(ROUTECACHE_FILE)
     times = []
@@ -484,8 +506,7 @@ def geocode_all_addresses(addresses: list, progress_cb=None) -> dict:
         for addr in bad_addresses:
             old_key = cache.get(addr.strip().lower())
             if old_key:
-                old_lat, old_lon = old_key[0], old_key[1]
-                bad_coord_prefix = f"{old_lat:.5f},{old_lon:.5f}"
+                bad_coord_prefix = f"{old_key[0]:.5f},{old_key[1]:.5f}"
                 stale = [k for k in rcache if bad_coord_prefix in k]
                 for k in stale:
                     del rcache[k]
@@ -586,83 +607,51 @@ def parse_vehicles_text(text: str) -> list:
     return vehicles
 
 # -----------------------------------------------------------------------------
-# TSP Sequencing - Strict camp-directional ordering
-#
-# PROBLEM WITH PREVIOUS APPROACHES:
-# The band algorithm and penalty approaches failed because stops like
-# Ambler (6mi from camp) and Lansdale (8mi) are close in distance but
-# the algorithm would pick Ambler first due to geographic proximity,
-# then backtrack to Lansdale.
-#
-# SOLUTION:
-# Sort all stops strictly by distance-from-camp descending (morning).
-# Then use nearest-neighbor but ONLY allow moves to stops that are
-# equal-or-closer to camp than the current stop (within a small slack).
-# This guarantees no backtracking while minimising driving within
-# the constraint.
+# TSP Sequencing - tier-based camp-directional
 # -----------------------------------------------------------------------------
 
 def _sequence_stops_camp_directional(stops: list, camp_lat: float, camp_lon: float,
                                       trip_direction: str = "morning") -> list:
-    """
-    Sequence stops so the route flows continuously toward camp (morning).
-
-    For morning routes:
-    - Sort stops by distance-from-camp DESCENDING (farthest first)
-    - At each step, only consider stops that are <= current stop's
-      distance from camp (plus slack). Pick the nearest of those.
-    - If no eligible stop exists, fall back to the next farthest overall.
-
-    This guarantees Lansdale (8mi) always comes before Ambler (6mi)
-    which always comes before Horsham (5mi), etc.
-    """
-    if not stops:
-        return stops
-
-    if len(stops) == 1:
-        return stops
+    if len(stops) <= 1:
+        return list(stops)
 
     def d2c(s):
         return haversine_mi(s.lat, s.lon, camp_lat, camp_lon)
 
-    # Sort by distance from camp
     if trip_direction == "afternoon":
-        ordered_by_dist = sorted(stops, key=d2c)           # nearest first
+        sorted_stops = sorted(stops, key=d2c)
     else:
-        ordered_by_dist = sorted(stops, key=d2c, reverse=True)  # farthest first
+        sorted_stops = sorted(stops, key=d2c, reverse=True)
 
-    result = [ordered_by_dist[0]]
-    unvisited = set(id(s) for s in ordered_by_dist[1:])
-    unvisited_list = list(ordered_by_dist[1:])
+    # Group into distance tiers
+    tiers = []
+    current_tier = [sorted_stops[0]]
+    ref_d = d2c(sorted_stops[0])
 
-    while unvisited_list:
-        last = result[-1]
-        last_d2c = d2c(last)
-
-        if trip_direction == "afternoon":
-            # Moving away from camp: eligible = farther than current
-            eligible = [s for s in unvisited_list
-                        if d2c(s) >= last_d2c - CAMP_DIRECTION_SLACK_MI]
+    for s in sorted_stops[1:]:
+        if abs(d2c(s) - ref_d) <= TIER_WIDTH_MI:
+            current_tier.append(s)
         else:
-            # Moving toward camp: eligible = closer than current
-            eligible = [s for s in unvisited_list
-                        if d2c(s) <= last_d2c + CAMP_DIRECTION_SLACK_MI]
+            tiers.append(current_tier)
+            current_tier = [s]
+            ref_d = d2c(s)
+    tiers.append(current_tier)
 
-        if eligible:
-            # Among eligible stops, pick geographically nearest
-            next_stop = min(eligible,
-                key=lambda s: haversine_mi(last.lat, last.lon, s.lat, s.lon))
-        else:
-            # All remaining stops would be a backtrack.
-            # Pick the one that backtracks least (closest to current d2c).
-            next_stop = min(unvisited_list,
-                key=lambda s: abs(d2c(s) - last_d2c))
+    # Within each tier, use nearest-neighbor
+    result = []
+    last_lat = sum(s.lat for s in tiers[0]) / len(tiers[0])
+    last_lon = sum(s.lon for s in tiers[0]) / len(tiers[0])
 
-        result.append(next_stop)
-        unvisited_list.remove(next_stop)
+    for tier in tiers:
+        remaining = list(tier)
+        while remaining:
+            nearest = min(remaining,
+                key=lambda s: haversine_mi(last_lat, last_lon, s.lat, s.lon))
+            result.append(nearest)
+            last_lat, last_lon = nearest.lat, nearest.lon
+            remaining.remove(nearest)
 
     return result
-
 
 # -----------------------------------------------------------------------------
 # Core routing
@@ -700,7 +689,7 @@ def cluster_and_route(students: list, vehicles: list,
     def uc(u): return u[0].lat, u[0].lon
     def d2c(u): return haversine_mi(*uc(u), camp_lat, camp_lon)
 
-    # -- 3. Geographic clustering - NO ZIP CODES ------------------------------
+    # -- 3. Geographic proximity clustering -----------------------------------
     clusters: list = []
     for unit in family_units:
         ulat, ulon = uc(unit)
@@ -729,8 +718,9 @@ def cluster_and_route(students: list, vehicles: list,
             name=v["name"], start_address=v["start"],
             capacity=v["capacity"], start_lat=lat, start_lon=lon))
 
-    # -- 5. Assign WHOLE CLUSTERS to vehicles ---------------------------------
+    # -- 5. Compass-aware cluster assignment ----------------------------------
     max_cap = max(v["capacity"] for v in vehicles)
+
     assignable: list = []
     for cl in clusters:
         if cl_size(cl) <= max_cap:
@@ -750,42 +740,43 @@ def cluster_and_route(students: list, vehicles: list,
 
     assignments = [[] for _ in veh_objects]
     counts = [0] * len(veh_objects)
+    veh_bearings = [[] for _ in veh_objects]
 
-    def nearest_vehicles(clat, clon):
-        return sorted(range(len(veh_objects)),
-                      key=lambda vi: haversine_mi(clat, clon,
-                                                   veh_objects[vi].start_lat,
-                                                   veh_objects[vi].start_lon))
+    def _cl_bearing(cl):
+        clat, clon = centroid(cl)
+        return bearing_deg(camp_lat, camp_lon, clat, clon)
 
-    def assign_unit_group(units, size):
-        clat = sum(uc(u)[0] for u in units) / len(units)
-        clon = sum(uc(u)[1] for u in units) / len(units)
-        for vi in nearest_vehicles(clat, clon):
-            if veh_objects[vi].capacity - counts[vi] >= size:
-                for u in units:
-                    assignments[vi].append(u)
-                counts[vi] += size
-                return vi
-        vi = min(range(len(veh_objects)), key=lambda i: counts[i])
-        for u in units:
-            assignments[vi].append(u)
-        counts[vi] += size
-        return vi
+    def _best_vehicle(cl, sz):
+        cl_b = _cl_bearing(cl)
+        clat, clon = centroid(cl)
+        compatible = []
+        fallback = []
+        for vi in range(len(veh_objects)):
+            if veh_objects[vi].capacity - counts[vi] < sz:
+                continue
+            geo = haversine_mi(clat, clon,
+                               veh_objects[vi].start_lat,
+                               veh_objects[vi].start_lon)
+            if _bearing_compatible(veh_bearings[vi], cl_b):
+                compatible.append((geo, vi))
+            else:
+                fallback.append((geo, vi))
+        compatible.sort()
+        fallback.sort()
+        if compatible:
+            return compatible[0][1]
+        if fallback:
+            return fallback[0][1]
+        return min(range(len(veh_objects)), key=lambda i: counts[i])
 
     for cl in assignable:
         sz = cl_size(cl)
-        clat, clon = centroid(cl)
-        assigned = False
-        for vi in nearest_vehicles(clat, clon):
-            if veh_objects[vi].capacity - counts[vi] >= sz:
-                for u in cl:
-                    assignments[vi].append(u)
-                counts[vi] += sz
-                assigned = True
-                break
-        if not assigned:
-            for u in cl:
-                assign_unit_group([u], len(u))
+        vi = _best_vehicle(cl, sz)
+        cl_b = _cl_bearing(cl)
+        for u in cl:
+            assignments[vi].append(u)
+        counts[vi] += sz
+        veh_bearings[vi].append(cl_b)
 
     # -- 5b. Consolidation ----------------------------------------------------
     changed, passes = True, 0
@@ -814,11 +805,14 @@ def cluster_and_route(students: list, vehicles: list,
             changed = True; continue
 
         src_lat, src_lon = centroid(units_src)
+        src_bearing = bearing_deg(camp_lat, camp_lon, src_lat, src_lon)
 
         full_dest, full_dist = None, float("inf")
         for vi_dst in range(len(veh_objects)):
             if vi_dst == vi_src: continue
             if veh_objects[vi_dst].capacity - counts[vi_dst] < total_src: continue
+            if not _bearing_compatible(veh_bearings[vi_dst], src_bearing):
+                continue
             if assignments[vi_dst]:
                 dlat, dlon = centroid(assignments[vi_dst])
             else:
@@ -830,7 +824,9 @@ def cluster_and_route(students: list, vehicles: list,
         if full_dest is not None and full_dist <= MAX_MERGE_MI:
             for u in units_src: assignments[full_dest].append(u)
             counts[full_dest] += total_src
+            veh_bearings[full_dest].append(src_bearing)
             assignments[vi_src] = []; counts[vi_src] = 0
+            veh_bearings[vi_src] = []
             if progress_cb:
                 progress_cb(f"  Merged {veh_objects[vi_src].name} ({total_src}) -> "
                             f"{veh_objects[full_dest].name} "
@@ -861,11 +857,15 @@ def cluster_and_route(students: list, vehicles: list,
             group_size = sum(len(u) for u in group)
             glat = sum(uc(u)[0] for u in group) / len(group)
             glon = sum(uc(u)[1] for u in group) / len(group)
+            g_bearing = bearing_deg(camp_lat, camp_lon, glat, glon)
             MAX_SCATTER_MI = 2.5
             best_vi, best_d = None, float("inf")
+
             for vi_dst in range(len(veh_objects)):
                 if vi_dst == vi_src: continue
                 if veh_objects[vi_dst].capacity - counts[vi_dst] < group_size: continue
+                if not _bearing_compatible(veh_bearings[vi_dst], g_bearing):
+                    continue
                 if assignments[vi_dst]:
                     d = min(haversine_mi(glat, glon, *uc(eu))
                             for eu in assignments[vi_dst])
@@ -883,6 +883,7 @@ def cluster_and_route(students: list, vehicles: list,
                     assignments[vi_src].remove(unit)
                 counts[best_vi] += group_size
                 counts[vi_src]  -= group_size
+                veh_bearings[best_vi].append(g_bearing)
                 moved = True
                 names = ", ".join(u[0].last for u in group)
                 if progress_cb:
@@ -906,7 +907,6 @@ def cluster_and_route(students: list, vehicles: list,
         if not assignments[vi]:
             veh.total_time = "---"; veh.total_distance = "---"; continue
 
-        # Build address-level stop objects
         addr_stop: dict = {}
         for unit in assignments[vi]:
             rep = unit[0]; key = rep.full_address.lower().strip()
@@ -920,42 +920,35 @@ def cluster_and_route(students: list, vehicles: list,
             for zs in zero_stops:
                 progress_cb(f"  Stop has no coordinates: {zs.address}")
 
-        # Sequence stops - strictly camp-directional, no backtracking
         sorted_stops = _sequence_stops_camp_directional(
             list(addr_stop.values()), camp_lat, camp_lon, trip_direction)
 
-        # Build coord sequence:
-        # index: 0=garage, 1=stop1, 2=stop2, ..., N=stopN, N+1=camp
+        # coord sequence: [garage, stop1, ..., stopN, camp]
         coord_seq = ([(veh.start_lat, veh.start_lon)]
                      + [(s.lat, s.lon) for s in sorted_stops]
                      + [(camp_lat, camp_lon)])
 
-        # Get all leg drive times at once
-        # legs[0]   = garage -> stop1   (deadhead, shown as "X min from garage")
-        # legs[1]   = stop1  -> stop2   (shown on stop2 as "X min")
-        # legs[i]   = stop(i) -> stop(i+1) for 0-indexed stops
-        # legs[N-1] = stop(N-1) -> stopN
-        # legs[N]   = stopN -> camp
+        # legs[0] = garage->stop1 (deadhead, not shown)
+        # legs[i] = stop(i-1)->stop(i) for i>=1
+        # legs[-1] = stopN->camp
         legs = route_leg_times(coord_seq, progress_cb)
 
-        # Assign drive times to each stop
-        # Stop at index i in sorted_stops:
-        #   - Stop 0 (first stop): time from garage = legs[0]
-        #   - Stop i (i>0): time from previous stop = legs[i]
+        # Stop 1: blank, stop 2+: stop-to-stop time
         for i, stop in enumerate(sorted_stops):
-            mins = max(1, round(legs[i]))
             if i == 0:
-                stop.drive_time = f"{mins} min from garage"
+                stop.drive_time = ""
             else:
+                mins = max(1, round(legs[i]))
                 stop.drive_time = f"{mins} min"
+
+        # Store last leg (stopN -> camp) for arrival row display
+        veh.last_leg_mins = max(1, round(legs[-1])) if legs else 0
 
         veh.stops = sorted_stops
         veh.camp_lat = camp_lat
         veh.camp_lon = camp_lon
 
-        # Kids ride time = stop1 -> stop2 -> ... -> stopN -> camp
-        # This is legs[1] through legs[N] (inclusive)
-        # = all legs EXCEPT legs[0] (the garage deadhead)
+        # Kids ride time = legs[1:] (excludes garage deadhead)
         kids_legs = legs[1:]
         kids_mins = round(sum(kids_legs))
         if kids_mins >= 60:
@@ -964,7 +957,6 @@ def cluster_and_route(students: list, vehicles: list,
         else:
             veh.total_time = f"{kids_mins} min"
 
-        # Total distance including garage deadhead
         dist = sum(
             haversine_mi(coord_seq[i][0], coord_seq[i][1],
                          coord_seq[i+1][0], coord_seq[i+1][1]) * ROAD_FACTOR
@@ -1010,9 +1002,9 @@ def build_dashboard(wb: Workbook, vehicles: list,
     direction_label = ("All vehicles depart from" if trip_direction == "afternoon"
                        else "All vehicles finish at")
     c.value = (f"{direction_label}: {camp_display} | "
-               "Clustered by real street-address proximity | "
+               "Compass-aware clustering | "
                "Drive times via Google Maps | "
-               "Kids Ride Time excludes garage-to-first-stop deadhead")
+               "Kids Ride Time = first stop to camp")
     c.font = _font(size=9, italic=True, color="444444")
     c.fill = _fill(BRAND_LIGHT)
     c.alignment = _align("center")
@@ -1080,8 +1072,8 @@ def build_dashboard(wb: Workbook, vehicles: list,
         c.fill = _fill(ORANGE_FILL)
     else:
         c.value = ("All vehicles at target capacity | "
-                   "Drive times via Google Maps | "
-                   "Stop order: farthest-from-camp first, flows toward camp")
+                   "Compass-aware clustering keeps stops in same direction | "
+                   "Kids Ride Time = first pickup to camp")
         c.font = _font(size=9, italic=True, color="555555")
     c.alignment = _align("left", wrap=True)
     ws.row_dimensions[lr].height = 28
@@ -1142,15 +1134,20 @@ def build_vehicle_sheet(wb: Workbook, veh: Vehicle,
         ws.row_dimensions[row].height = 14
 
     arrive = 5 + len(veh.stops)
-    if veh.stops:
-        last = veh.stops[-1]
-        final = max(1, round(_fallback_minutes(last.lat, last.lon, *CAMP_COORDS)))
-        arrive_time = f"{final} min -> ARRIVE"
-    else:
-        arrive_time = "--- -> ARRIVE"
 
+    # Use Google Maps last-leg time if available, else fall back to estimate
+    if veh.last_leg_mins and veh.last_leg_mins > 0:
+        final_mins = veh.last_leg_mins
+    elif veh.stops:
+        last = veh.stops[-1]
+        final_mins = max(1, round(_fallback_minutes(last.lat, last.lon, *CAMP_COORDS)))
+    else:
+        final_mins = 0
+
+    arrive_time = f"{final_mins} min -> ARRIVE" if final_mins else "-> ARRIVE"
     arrive_label = camp_address or CAMP_ADDRESS
     action_word = "DEPART" if trip_direction == "afternoon" else "ARRIVE"
+
     for ci, val in enumerate([action_word, arrive_label, "---", "---", arrive_time], 1):
         cell = ws.cell(row=arrive, column=ci, value=val)
         cell.font = _font(bold=True, color="006400")
@@ -1169,7 +1166,7 @@ def build_vehicle_sheet(wb: Workbook, veh: Vehicle,
     ws.merge_cells(f"A{nr}:E{nr}")
     note = ws[f"A{nr}"]
     note.value = ("Drive times via Google Maps | "
-                  "Stops ordered farthest-from-camp first, flowing toward camp | "
+                  "Compass-aware clustering - stops in same direction from camp | "
                   "Kids Ride Time = first pickup to camp (excludes garage deadhead)")
     note.font = _font(size=8, italic=True, color="777777")
     note.alignment = _align("left")
