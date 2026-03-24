@@ -772,7 +772,10 @@ fits = [i for i in range(len(veh_objects)) if veh_objects[i].capacity - counts[i
 if fits:
     return min(fits, key=lambda i: counts[i])
 # Absolute last resort — least loaded (should rarely happen)
-return min(range(len(veh_objects)), key=lambda i: veh_objects[i].capacity - counts[i])
+fits = [i for i in range(len(veh_objects)) if veh_objects[i].capacity - counts[i] >= sz]
+        if fits:
+            return min(fits, key=lambda i: counts[i])
+        return min(range(len(veh_objects)), key=lambda i: veh_objects[i].capacity - counts[i])
 
     for cl in assignable:
         sz = cl_size(cl)
