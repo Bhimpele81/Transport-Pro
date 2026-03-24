@@ -483,7 +483,17 @@ def clear_bad_geocache() -> int:
     return len(bad_keys)
 
 def geocode_all_addresses(addresses: list, progress_cb=None) -> dict:
+    # Built-in hardcoded coords for addresses that may fail geocoding
+    # (e.g. addresses outside PA bounds check, or without ZIP codes)
+    BUILTIN_COORDS = {
+        "7826 loretto ave, philadelphia, pa": (40.0601079, -75.0605883),
+        "114 s main st, quakertown, pa": (40.4417, -75.3412),
+    }
     cache = _load_json(GEOCACHE_FILE)
+    # Inject built-in coords into cache so they are always correct
+    for addr_key, coords_val in BUILTIN_COORDS.items():
+        if addr_key not in cache or not _in_pa(*tuple(cache[addr_key])):
+            cache[addr_key] = list(coords_val)
     purged = _purge_bad_geocache(cache, addresses, progress_cb)
     if purged and progress_cb:
         progress_cb(f"  Purged {purged} bad geocache entries - will re-geocode")
