@@ -767,7 +767,12 @@ def cluster_and_route(students: list, vehicles: list,
             return compatible[0][1]
         if fallback:
             return fallback[0][1]
-        return min(range(len(veh_objects)), key=lambda i: counts[i])
+        # Never exceed capacity — find least loaded vehicle that still fits
+fits = [i for i in range(len(veh_objects)) if veh_objects[i].capacity - counts[i] >= sz]
+if fits:
+    return min(fits, key=lambda i: counts[i])
+# Absolute last resort — least loaded (should rarely happen)
+return min(range(len(veh_objects)), key=lambda i: veh_objects[i].capacity - counts[i])
 
     for cl in assignable:
         sz = cl_size(cl)
