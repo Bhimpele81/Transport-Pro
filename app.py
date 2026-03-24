@@ -175,6 +175,26 @@ def api_run():
 
     return jsonify({"job_id": job_id})
 
+@app.route("/api/version")
+def api_version():
+    import bus_route_optimizer as bro
+    import inspect
+    src = inspect.getsource(bro.cluster_and_route)
+    has_far_garage = "FAR_GARAGE_MI" in src
+    has_fits = "fits = [i for i" in src
+    overrides_exist = os.path.exists("coord_overrides.json")
+    overrides = {}
+    if overrides_exist:
+        with open("coord_overrides.json") as f:
+            overrides = json.load(f)
+    return jsonify({
+        "has_far_garage_fix": has_far_garage,
+        "has_fits_fix": has_fits,
+        "coord_overrides_exists": overrides_exist,
+        "coord_overrides_keys": list(overrides.keys()),
+        "philadelphia_coords": overrides.get("7826 loretto ave, philadelphia, pa"),
+    })
+
 @app.route("/api/debug-coords")
 def api_debug_coords():
     """Show all cached coordinates — helps diagnose missing map stops."""
