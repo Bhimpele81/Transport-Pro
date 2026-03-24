@@ -957,7 +957,7 @@ function renderFleet() {
         ${VEHICLE_NAMES.map(n => `<option value="${n}" ${n===veh.name?'selected':''}>${n}</option>`).join('')}
       </select>
       <input type="text" placeholder="e.g. 828 Elbow Lane, Warrington, PA"
-        value="${veh.address}" data-idx="${i}" data-field="address" list="addr-suggestions" autocomplete="off">
+        value="${veh.address}" data-idx="${i}" data-field="address" list="addr-suggestions">
       <select data-idx="${i}" data-field="capacity">
         ${CAPACITIES.map(c => `<option value="${c}" ${c===veh.capacity?'selected':''}>${c} riders</option>`).join('')}
       </select>
@@ -1626,7 +1626,7 @@ async function loadSavedAddresses() {
     savedAddresses = await res.json();
     const dl = document.getElementById('addr-suggestions');
     dl.innerHTML = savedAddresses
-      .map(a => `<option value="${a.replace(/"/g, '&quot;')}">`)
+      .map(a => `<option value="${a.replace(/"/g, '&quot;')}">${a.replace(/</g, '&lt;')}</option>`)
       .join('');
   } catch(e) { /* non-critical */ }
 }
