@@ -789,10 +789,20 @@ def cluster_and_route(students: list, vehicles: list,
             if cap <= 9:  return 0.50
             return MIN_UTIL
 
+        # Vehicles with a garage far from camp serve a distinct geographic
+        # corridor (e.g. Philadelphia) and should NOT be consolidated away
+        # unless they have zero students. Their low utilization is expected.
+        FAR_GARAGE_MI = 8.0
+        def is_far_garage(vi):
+            return haversine_mi(
+                veh_objects[vi].start_lat, veh_objects[vi].start_lon,
+                camp_lat, camp_lon) > FAR_GARAGE_MI
+
         under = sorted(
             [vi for vi in range(len(veh_objects))
-             if counts[vi] > 0 and
-             counts[vi] / veh_objects[vi].capacity < effective_threshold(vi)],
+             if counts[vi] > 0
+             and counts[vi] / veh_objects[vi].capacity < effective_threshold(vi)
+             and not is_far_garage(vi)],
             key=lambda vi: counts[vi])
 
         if not under: break
@@ -965,7 +975,12 @@ def cluster_and_route(students: list, vehicles: list,
 
         cap = veh.capacity
         eff_threshold = 0.50 if cap <= 6 else (0.60 if cap <= 9 else MIN_UTIL)
-        veh.under_threshold = (veh.rider_count / cap < eff_threshold if cap else False)
+        far_garage = haversine_mi(
+            veh.start_lat, veh.start_lon, camp_lat, camp_lon) > 8.0
+        veh.under_threshold = (
+            not far_garage
+            and veh.rider_count / cap < eff_threshold
+            if cap else False)
 
     return veh_objects
 
