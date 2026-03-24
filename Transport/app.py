@@ -1,1476 +1,1585 @@
 """
-Bus Route Optimizer — Elbow Lane Day Camp
-==========================================
-• Geocodes every street address via OpenStreetMap Nominatim (free, no key)
-• Clusters students by TRUE address-level proximity — ZIP codes ignored
-• Gets real driving times via OSRM road-network API (free, no key)
-  Falls back to road-factor estimate when OSRM is unavailable
-• Assigns whole geographic clusters to vehicles (neighbors always same van)
-• Eliminates empty vehicles; warns about under-filled ones in spreadsheet
-• Outputs a formatted Excel workbook in Elbow Lane brand colors
-
-Dependencies:  pip install openpyxl
-
-Usage (CLI):
-    python bus_route_optimizer.py --csv students.csv --vehicles fleet.txt
-
-Usage (import):
-    from bus_route_optimizer import generate_routes
-    generate_routes(csv_text, vehicles_text, "output.xlsx", progress_cb=print)
+Elbow Lane Day Camp — Bus Route Optimizer
+Flask web application with fleet builder UI and in-app route viewer.
+Run with: python app.py
 """
 
-import argparse, csv, io, json, math, os, re, time, urllib.parse, urllib.request
-from dataclasses import dataclass, field
-from typing import Optional, Callable
+import os, uuid, threading, json, urllib.parse, urllib.request
+from flask import Flask, request, jsonify, send_file, render_template_string, send_from_directory
+from bus_route_optimizer import (
+    generate_routes, parse_students_csv, parse_vehicles_text,
+    cluster_and_route, Stop, Vehicle
+)
 
-from openpyxl import Workbook
-from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
-from openpyxl.utils import get_column_letter
+app = Flask(__name__)
+app.config["MAX_CONTENT_LENGTH"] = 5 * 1024 * 1024
 
-# ── Brand / tuneable constants ────────────────────────────────────────────────
-GOOGLE_MAPS_KEY = os.environ.get("GOOGLE_MAPS_KEY", "")   # set in Replit Secrets
-CAMP_ADDRESS    = "828 Elbow Lane, Warrington, PA 18976"
-CAMP_COORDS     = (40.2454, -75.1407)   # fallback if geocode fails
-GEOCACHE_FILE   = "geocache.json"        # on-disk cache for lat/lon lookups
-ROUTECACHE_FILE = "routecache.json"      # on-disk cache for OSRM driving times
-COORD_OVERRIDES_FILE = "coord_overrides.json"  # user-editable GPS overrides
-NEIGHBOR_MI     = 1.5                    # houses ≤ 1.5 mi apart → same-van candidate
-MIN_UTIL        = 0.60                   # target minimum utilisation per vehicle
-ROAD_FACTOR     = 1.35                   # road distance ≈ straight-line × 1.35
-MPH_SUBURBAN    = 30.0                   # average speed for fallback time estimate
+jobs: dict = {}
+jobs_lock = threading.Lock()
 
-# ---------------------------------------------------------------------------
-# Coordinate overrides — bypasses Nominatim for addresses it gets wrong.
-# Keys are lowercase address strings. Values are [lat, lon].
-# These are loaded from coord_overrides.json if it exists, and ALWAYS
-# take priority over Nominatim results and the geocache.
-# To add a new override: add a line to coord_overrides.json, or call
-# add_coord_override(address, lat, lon) from your app.
-# ---------------------------------------------------------------------------
-def _load_overrides() -> dict:
-    """Load user coordinate overrides from disk."""
-    return _load_json(COORD_OVERRIDES_FILE)
+os.makedirs("uploads", exist_ok=True)
+os.makedirs("outputs", exist_ok=True)
 
-def add_coord_override(address: str, lat: float, lon: float) -> None:
-    """
-    Permanently override the geocoded coordinates for an address.
-    Use this when Nominatim returns wrong coordinates for a specific address.
-    The override is saved to coord_overrides.json and used on all future runs.
-    Also clears any cached geocode and route-time entries for this address.
-    """
-    overrides = _load_overrides()
-    key = address.strip().lower()
-    overrides[key] = [lat, lon]
-    _save_json(COORD_OVERRIDES_FILE, overrides)
-    
-    # Also update geocache and clear stale route times
-    cache = _load_json(GEOCACHE_FILE)
-    old_coords = cache.get(key)
-    cache[key] = [lat, lon]
-    _save_json(GEOCACHE_FILE, cache)
-    
-    if old_coords:
-        rcache = _load_json(ROUTECACHE_FILE)
-        bad_prefix = f"{old_coords[0]:.5f},{old_coords[1]:.5f}"
-        stale = [k for k in rcache if bad_prefix in k]
-        for k in stale:
-            del rcache[k]
-        if stale:
-            _save_json(ROUTECACHE_FILE, rcache)
+CAMP_COORDS = (40.2454, -75.1407)
 
-# ── Excel colour palette (Elbow Lane brand) ───────────────────────────────────
-BRAND_COLOR  = "6D1F2F"   # deep burgundy
-BRAND_LIGHT  = "F5E6E9"   # pale rose — subtitle bar
-LIGHT_GRAY   = "F2F2F2"
-YELLOW_FILL  = "FFEB9C"   # under-threshold warning
-ORANGE_FILL  = "FFD966"   # utilisation warning row
-GREEN_FILL   = "E2EFDA"
-WHITE        = "FFFFFF"
-DARK_TEXT    = "1A1A1A"
-MED_SIDE     = Side(style="medium", color=BRAND_COLOR)
-THIN_SIDE    = Side(style="thin",   color="CCCCCC")
+# ── Serialise route data for JSON API ─────────────────────────────────────────
 
+def vehicles_to_json(vehicles: list) -> list:
+    out = []
+    for v in vehicles:
+        out.append({
+            "name": v.name,
+            "start_address": v.start_address,
+            "capacity": v.capacity,
+            "rider_count": v.rider_count,
+            "stop_count": v.stop_count,
+            "utilization_pct": v.utilization_pct,
+            "total_time": v.total_time,
+            "total_distance": v.total_distance,
+            "under_threshold": v.under_threshold,
+            "corridor": v.corridor,
+            "start_lat": v.start_lat,
+            "start_lon": v.start_lon,
+            "camp_lat": getattr(v, "camp_lat", 40.2454),
+            "camp_lon": getattr(v, "camp_lon", -75.1407),
+            "last_leg_mins": getattr(v, "last_leg_mins", 0),
+            "stops": [
+                {
+                    "stop_num": i + 1,
+                    "address": s.address,
+                    "rider_names": s.rider_names,
+                    "rider_count": s.rider_count,
+                    "drive_time": s.drive_time,
+                    "lat": s.lat,
+                    "lon": s.lon,
+                }
+                for i, s in enumerate(v.stops)
+            ],
+        })
+    return out
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Data structures
-# ─────────────────────────────────────────────────────────────────────────────
+# ── Background worker ──────────────────────────────────────────────────────────
 
-@dataclass
-class Student:
-    idx: int
-    last: str
-    first: str
-    address: str
-    city: str
-    zip_code: str
-    lat: float = 0.0
-    lon: float = 0.0
-    geocoded: bool = False
+def run_job(job_id: str, csv_text: str, vehicles_text: str,
+            camp_address: str = None, trip_direction: str = "morning"):
+    output_path = os.path.join("outputs", f"routes_{job_id}.xlsx")
 
-    @property
-    def full_address(self) -> str:
-        return f"{self.address}, {self.city}, PA {self.zip_code}"
+    def progress(msg: str):
+        with jobs_lock:
+            jobs[job_id]["progress"].append(msg)
 
-
-@dataclass
-class Stop:
-    address: str
-    riders: list = field(default_factory=list)
-    drive_time: str = ""
-    lat: float = 0.0
-    lon: float = 0.0
-
-    @property
-    def rider_count(self) -> int:
-        return len(self.riders)
-
-    @property
-    def rider_names(self) -> str:
-        freq: dict = {}
-        for s in self.riders:
-            freq[s.last] = freq.get(s.last, 0) + 1
-        ctr: dict = {}
-        names = []
-        for s in self.riders:
-            if freq[s.last] > 1:
-                ctr[s.last] = ctr.get(s.last, 0) + 1
-                names.append(f"{s.last}{ctr[s.last]}")
-            else:
-                names.append(s.last)
-        return ", ".join(names)
-
-
-@dataclass
-class Vehicle:
-    name: str
-    start_address: str
-    capacity: int
-    stops: list        = field(default_factory=list)
-    total_time: str    = ""
-    total_distance: str = ""
-    under_threshold: bool = False   # True when utilisation < MIN_UTIL
-    start_lat: float   = 0.0
-    start_lon: float   = 0.0
-    camp_lat:  float   = 0.0
-    camp_lon:  float   = 0.0
-
-    @property
-    def rider_count(self) -> int:
-        return sum(s.rider_count for s in self.stops)
-
-    @property
-    def stop_count(self) -> int:
-        return len(self.stops)
-
-    @property
-    def utilization_pct(self) -> int:
-        return round(self.rider_count / self.capacity * 100) if self.capacity else 0
-
-    @property
-    def corridor(self) -> str:
-        cities, seen = [], set()
-        for stop in self.stops:
-            parts = stop.address.split(",")
-            city = parts[1].strip() if len(parts) >= 3 else ""
-            if city and city not in seen:
-                seen.add(city)
-                cities.append(city)
-        start_city = (self.start_address.split(",")[1].strip()
-                      if "," in self.start_address else "")
-        return f"{start_city} → " + " → ".join(cities[:3]) if cities else start_city
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Geometry helpers
-# ─────────────────────────────────────────────────────────────────────────────
-
-def haversine_mi(lat1, lon1, lat2, lon2) -> float:
-    """Straight-line distance in miles between two lat/lon points."""
-    R = 3958.8
-    p1, p2 = math.radians(lat1), math.radians(lat2)
-    a = (math.sin(math.radians(lat2-lat1)/2)**2
-         + math.cos(p1)*math.cos(p2)*math.sin(math.radians(lon2-lon1)/2)**2)
-    return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1-a))
-
-
-def centroid(units: list) -> tuple:
-    """Average lat/lon of a list of family units."""
-    lats = [u[0].lat for u in units]
-    lons = [u[0].lon for u in units]
-    return sum(lats)/len(lats), sum(lons)/len(lons)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# OSRM real driving times  (free public API, no key needed)
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _load_json(path: str) -> dict:
-    if os.path.exists(path):
-        try:
-            with open(path) as f:
-                return json.load(f)
-        except Exception:
-            pass
-    return {}
-
-
-def clear_bad_geocache() -> int:
-    """
-    Remove geocache entries that have coordinates outside Pennsylvania.
-    These are bad Nominatim results that caused clustering failures.
-    Returns the number of entries removed.
-    Call this if you see geographically wrong routing results.
-    """
-    cache = _load_json(GEOCACHE_FILE)
-    bad_keys = [k for k, v in cache.items()
-                if not _in_pa(v[0], v[1])]
-    for k in bad_keys:
-        del cache[k]
-    if bad_keys:
-        _save_json(GEOCACHE_FILE, cache)
-    return len(bad_keys)
-
-
-def _save_json(path: str, data: dict) -> None:
     try:
-        with open(path, "w") as f:
-            json.dump(data, f, indent=2)
-    except Exception:
-        pass
+        with jobs_lock:
+            jobs[job_id]["status"] = "running"
 
+        students = parse_students_csv(csv_text)
+        vcfgs = parse_vehicles_text(vehicles_text)
+        vehicles = cluster_and_route(students, vcfgs, progress,
+                                     camp_address=camp_address,
+                                     trip_direction=trip_direction)
 
-def _fallback_minutes(lat1, lon1, lat2, lon2) -> float:
-    """Road-factor estimate: much better than raw straight-line × 3 min/mi."""
-    road_mi = haversine_mi(lat1, lon1, lat2, lon2) * ROAD_FACTOR
-    return (road_mi / MPH_SUBURBAN) * 60.0
+        from openpyxl import Workbook
+        from bus_route_optimizer import build_dashboard, build_vehicle_sheet
+        wb = Workbook()
+        build_dashboard(wb, vehicles, camp_address=camp_address, trip_direction=trip_direction)
+        for veh in vehicles:
+            build_vehicle_sheet(wb, veh, camp_address=camp_address, trip_direction=trip_direction)
+        wb.save(output_path)
+        progress("✅ Excel saved")
 
+        camp_lat_val = vehicles[0].camp_lat if vehicles else CAMP_COORDS[0]
+        camp_lon_val = vehicles[0].camp_lon if vehicles else CAMP_COORDS[1]
 
-def driving_minutes(lat1, lon1, lat2, lon2, cache: dict) -> float:
+        with jobs_lock:
+            jobs[job_id]["status"] = "done"
+            jobs[job_id]["output_path"] = output_path
+            jobs[job_id]["route_data"] = vehicles_to_json(vehicles)
+            jobs[job_id]["camp_address"] = camp_address
+            jobs[job_id]["trip_direction"] = trip_direction
+            jobs[job_id]["camp_lat"] = camp_lat_val
+            jobs[job_id]["camp_lon"] = camp_lon_val
+
+    except Exception as e:
+        import traceback
+        with jobs_lock:
+            jobs[job_id]["status"] = "error"
+            jobs[job_id]["error"] = str(e)
+        progress(f"❌ Error: {e}")
+
+# ── API routes ─────────────────────────────────────────────────────────────────
+
+@app.route("/")
+def index():
+    key = os.environ.get("GOOGLE_MAPS_KEY", "")
+    return render_template_string(HTML.replace(
+        '"{{ google_maps_key }}"', f'"{key}"'
+    ))
+
+@app.route("/logo.png")
+def serve_logo():
+    return send_from_directory(os.path.dirname(os.path.abspath(__file__)), "logo.png")
+
+@app.route("/api/run", methods=["POST"])
+def api_run():
+    csv_file = request.files.get("csv_file")
+    vehicles_text = request.form.get("vehicles_text", "").strip()
+
+    if not csv_file:
+        return jsonify({"error": "No CSV file uploaded"}), 400
+    if not vehicles_text:
+        return jsonify({"error": "No fleet configuration provided"}), 400
+
+    csv_text = csv_file.read().decode("utf-8-sig", errors="replace")
+    camp_address = request.form.get("camp_address", "").strip() or None
+    trip_direction = request.form.get("trip_direction", "morning")
+
+    try:
+        students = parse_students_csv(csv_text)
+        if not students:
+            first_line = csv_text.strip().split("\n")[0].lower() if csv_text.strip() else ""
+            has_name = "name" in first_line
+            has_addr = "address" in first_line or "street" in first_line
+            if not (has_name and has_addr):
+                return jsonify({"error":
+                    "Could not find required columns. Make sure your CSV has a header row "
+                    "with column names like: Last name, First name, Address, City, Zip. "
+                    "The first row must contain column headers, not student data."}), 400
+            return jsonify({"error": "No students found in CSV. The file may be empty."}), 400
+    except Exception as e:
+        return jsonify({"error": f"CSV parse error: {e}"}), 400
+
+    try:
+        vcfgs = parse_vehicles_text(vehicles_text)
+        if not vcfgs:
+            return jsonify({"error": "No vehicles parsed. Check fleet configuration."}), 400
+    except Exception as e:
+        return jsonify({"error": f"Fleet config error: {e}"}), 400
+
+    job_id = str(uuid.uuid4())[:8]
+    with jobs_lock:
+        jobs[job_id] = {
+            "status": "queued",
+            "progress": [f"✓ Loaded {len(students)} students, {len(vcfgs)} vehicles"],
+            "output_path": None,
+            "route_data": None,
+            "error": None,
+            "camp_address": camp_address,
+            "trip_direction": trip_direction,
+        }
+
+    threading.Thread(
+        target=run_job,
+        args=(job_id, csv_text, vehicles_text, camp_address, trip_direction),
+        daemon=True
+    ).start()
+
+    return jsonify({"job_id": job_id})
+
+@app.route("/api/debug-coords")
+def api_debug_coords():
+    """Show all cached coordinates — helps diagnose missing map stops."""
+    geocache_file = "geocache.json"
+    if not os.path.exists(geocache_file):
+        return jsonify({"error": "No geocache found — run routes first"}), 404
+
+    with open(geocache_file) as f:
+        cache = json.load(f)
+
+    results = []
+    for addr, coords in sorted(cache.items()):
+        lat, lon = coords[0], coords[1]
+        suspicious = abs(lat) < 0.001 or abs(lon) < 0.001
+        camp_fallback = abs(lat - 40.2454) < 0.001 and abs(lon + 75.1407) < 0.001
+        results.append({
+            "address": addr, "lat": lat, "lon": lon,
+            "suspicious": suspicious, "camp_fallback": camp_fallback,
+        })
+
+    bad = [r for r in results if r["suspicious"] or r["camp_fallback"]]
+    return jsonify({"total": len(results), "bad_count": len(bad),
+                    "bad_entries": bad, "all_entries": results})
+
+@app.route("/api/clear-cache", methods=["POST"])
+def api_clear_cache():
+    """Delete geocache and routecache so all addresses are re-geocoded fresh."""
+    cleared = []
+    for f in ["geocache.json", "routecache.json"]:
+        if os.path.exists(f):
+            os.remove(f)
+            cleared.append(f)
+    return jsonify({"cleared": cleared,
+                    "message": f"Cleared {len(cleared)} cache files. Next run will re-geocode all addresses using Google Maps."})
+
+@app.route("/api/status/<job_id>")
+def api_status(job_id: str):
+    with jobs_lock:
+        job = jobs.get(job_id)
+    if not job:
+        return jsonify({"error": "Job not found"}), 404
+    return jsonify({
+        "status": job["status"],
+        "progress": job["progress"],
+        "error": job.get("error"),
+        "route_data": job.get("route_data"),
+    })
+
+@app.route("/api/recalculate/<job_id>", methods=["POST"])
+def api_recalculate(job_id: str):
+    """Accept manually edited route data, recompute drive times, regenerate Excel."""
+    with jobs_lock:
+        job = jobs.get(job_id)
+    if not job:
+        return jsonify({"error": "Job not found"}), 404
+
+    edited_vehicles = request.json.get("vehicles", [])
+    if not edited_vehicles:
+        return jsonify({"error": "No vehicle data provided"}), 400
+
+    try:
+        from bus_route_optimizer import (
+            build_dashboard, build_vehicle_sheet,
+            route_leg_times, haversine_mi, CAMP_COORDS as CC,
+            _sequence_stops_camp_directional
+        )
+        from openpyxl import Workbook
+
+        camp_address = job.get("camp_address") or "828 Elbow Lane, Warrington, PA 18976"
+        trip_direction = job.get("trip_direction") or "morning"
+
+        class EditableStop:
+            def __init__(self, d):
+                self.address = d["address"]
+                self.rider_names = d.get("rider_names", "")
+                self.rider_count = int(d.get("rider_count", 0))
+                self.lat = float(d.get("lat", 0) or 0)
+                self.lon = float(d.get("lon", 0) or 0)
+                self.drive_time = d.get("drive_time", "—")
+                self.geocoded = True
+
+        vehicles = []
+        for vd in edited_vehicles:
+            stops = [EditableStop(sd) for sd in vd.get("stops", [])
+                     if sd.get("rider_names") and int(sd.get("rider_count", 0)) > 0]
+
+            veh = Vehicle(
+                name=vd["name"],
+                start_address=vd["start_address"],
+                capacity=vd["capacity"],
+                stops=stops,
+                total_time=vd.get("total_time", "—"),
+                total_distance=vd.get("total_distance", "—"),
+                under_threshold=vd.get("under_threshold", False),
+                start_lat=vd.get("start_lat", 0.0),
+                start_lon=vd.get("start_lon", 0.0),
+                camp_lat=vd.get("camp_lat", CC[0]),
+                camp_lon=vd.get("camp_lon", CC[1]),
+            )
+
+            # Resequence using two-phase camp-directional algorithm
+            if len(veh.stops) > 1:
+                camp_lat = veh.camp_lat or CC[0]
+                camp_lon = veh.camp_lon or CC[1]
+                veh.stops = _sequence_stops_camp_directional(
+                    veh.stops, camp_lat, camp_lon, trip_direction)
+
+            # Recalculate drive times
+            if veh.stops and (veh.start_lat or veh.start_lon):
+                camp_lat = veh.camp_lat or CC[0]
+                camp_lon = veh.camp_lon or CC[1]
+                coord_seq = ([(veh.start_lat, veh.start_lon)]
+                             + [(s.lat, s.lon) for s in veh.stops]
+                             + [(camp_lat, camp_lon)])
+                legs = route_leg_times(coord_seq)
+
+                for i, stop in enumerate(veh.stops):
+                    mins = max(1, round(legs[i]))
+                    stop.drive_time = f"{mins} min from start" if i == 0 else f"{mins} min"
+
+                # Kids ride time excludes garage deadhead
+                kids_mins = round(sum(legs[1:]))
+                hrs, rem = divmod(kids_mins, 60)
+                veh.total_time = (f"{hrs} hr {rem} min" if hrs and rem
+                                  else (f"{hrs} hr" if hrs else f"{kids_mins} min"))
+
+                total_mi = sum(
+                    haversine_mi(coord_seq[i][0], coord_seq[i][1],
+                                 coord_seq[i+1][0], coord_seq[i+1][1]) * 1.35
+                    for i in range(len(coord_seq)-1))
+                veh.total_distance = f"{round(total_mi, 1)} mi"
+
+            cap = veh.capacity
+            eff = 0.40 if cap <= 6 else (0.50 if cap <= 9 else 0.60)
+            veh.under_threshold = (veh.rider_count / cap < eff) if cap else False
+
+            vehicles.append(veh)
+
+        # Regenerate Excel
+        output_path = os.path.join("outputs", f"routes_{job_id}_edited.xlsx")
+        wb = Workbook()
+        build_dashboard(wb, vehicles, camp_address=camp_address, trip_direction=trip_direction)
+        for veh in vehicles:
+            build_vehicle_sheet(wb, veh, camp_address=camp_address, trip_direction=trip_direction)
+        wb.save(output_path)
+
+        with jobs_lock:
+            jobs[job_id]["output_path"] = output_path
+            jobs[job_id]["route_data"] = vehicles_to_json(vehicles)
+
+        return jsonify({"status": "ok", "route_data": jobs[job_id]["route_data"]})
+
+    except Exception as e:
+        import traceback
+        return jsonify({"error": str(e), "trace": traceback.format_exc()}), 500
+
+# ── Route polyline endpoint (road-following lines for map display) ─────────────
+
+@app.route("/api/route-polyline", methods=["POST"])
+def api_route_polyline():
     """
-    Real driving time in minutes via Google Directions API.
-    Falls back to OSRM, then road-factor haversine estimate if unavailable.
-    Results cached in routecache.json so each pair is only queried once.
+    Given an ordered list of {lat, lng} points, returns road-following
+    polyline coordinates by calling the Google Directions API.
+    Falls back to returning the original straight-line coords if API fails,
+    so the map always draws something.
     """
-    key = f"{lat1:.5f},{lon1:.5f}|{lat2:.5f},{lon2:.5f}"
-    if key in cache:
-        return cache[key]
+    data = {}
+    try:
+        data = request.get_json(force=True) or {}
+        points = data.get("points", [])
 
-    # ── Try Google Directions API first ──────────────────────────────────
-    if GOOGLE_MAPS_KEY:
-        try:
-            params = urllib.parse.urlencode({
-                "origin":      f"{lat1},{lon1}",
-                "destination": f"{lat2},{lon2}",
-                "mode":        "driving",
-                "key":         GOOGLE_MAPS_KEY,
+        if len(points) < 2:
+            return jsonify({"coords": [], "errors": ["Need at least 2 points"]})
+
+        google_key = os.environ.get("GOOGLE_MAPS_KEY", "")
+        if not google_key:
+            return jsonify({
+                "coords": [{"lat": p["lat"], "lng": p["lng"]} for p in points],
+                "errors": ["No Google Maps key — using straight lines"]
             })
-            url = f"https://maps.googleapis.com/maps/api/directions/json?{params}"
-            req = urllib.request.Request(url,
-                headers={"User-Agent": "ElbowLaneCampBusRouter/1.0"})
-            with urllib.request.urlopen(req, timeout=8) as resp:
-                data = json.loads(resp.read().decode())
-            if data.get("status") == "OK":
-                mins = data["routes"][0]["legs"][0]["duration"]["value"] / 60.0
-                cache[key] = mins
-                _save_json(ROUTECACHE_FILE, cache)
-                return mins
-        except Exception:
-            pass   # fall through to OSRM
 
-    # ── Fallback: OSRM ───────────────────────────────────────────────────
+        origin = f"{points[0]['lat']},{points[0]['lng']}"
+        destination = f"{points[-1]['lat']},{points[-1]['lng']}"
+        waypoints_list = points[1:-1]
+
+        all_coords = []
+        errors = []
+
+        if len(waypoints_list) <= 23:
+            all_coords, err = _fetch_directions_polyline(
+                origin, destination, waypoints_list, google_key)
+            if err:
+                errors.append(err)
+        else:
+            # Too many waypoints — split into chunks of 23
+            chunk_size = 23
+            prev_point = points[0]
+            remaining = points[1:]
+            while remaining:
+                chunk = remaining[:chunk_size + 1]
+                chunk_origin = f"{prev_point['lat']},{prev_point['lng']}"
+                chunk_dest = f"{chunk[-1]['lat']},{chunk[-1]['lng']}"
+                chunk_wps = chunk[:-1]
+                coords, err = _fetch_directions_polyline(
+                    chunk_origin, chunk_dest, chunk_wps, google_key)
+                if err:
+                    errors.append(err)
+                if coords:
+                    if all_coords:
+                        coords = coords[1:]  # avoid duplicate junction point
+                    all_coords.extend(coords)
+                prev_point = chunk[-1]
+                remaining = remaining[chunk_size + 1:]
+
+        if not all_coords:
+            # Complete fallback — return straight line coords so map still draws
+            return jsonify({
+                "coords": [{"lat": p["lat"], "lng": p["lng"]} for p in points],
+                "errors": errors or ["Directions API returned no route"]
+            })
+
+        return jsonify({"coords": all_coords, "errors": errors})
+
+    except Exception as e:
+        # Always return 200 with fallback coords so frontend doesn't break
+        return jsonify({
+            "coords": [{"lat": p["lat"], "lng": p["lng"]} for p in data.get("points", [])],
+            "errors": [str(e)]
+        }), 200
+
+
+def _fetch_directions_polyline(origin, destination, waypoints, google_key):
+    """
+    Call Google Directions API and decode the step-level polylines.
+    Returns (list_of_lat_lng_dicts, error_string_or_None).
+    """
+    params = {
+        "origin": origin,
+        "destination": destination,
+        "mode": "driving",
+        "key": google_key,
+    }
+    if waypoints:
+        params["waypoints"] = "|".join(f"{p['lat']},{p['lng']}" for p in waypoints)
+
+    url = ("https://maps.googleapis.com/maps/api/directions/json?"
+           + urllib.parse.urlencode(params))
+
     try:
-        url = (f"http://router.project-osrm.org/route/v1/driving/"
-               f"{lon1:.6f},{lat1:.6f};{lon2:.6f},{lat2:.6f}"
-               f"?overview=false")
         req = urllib.request.Request(
             url, headers={"User-Agent": "ElbowLaneCampBusRouter/1.0"})
-        with urllib.request.urlopen(req, timeout=5) as resp:
-            data = json.loads(resp.read().decode())
-        if data.get("code") == "Ok":
-            mins = data["routes"][0]["duration"] / 60.0
-            cache[key] = mins
-            _save_json(ROUTECACHE_FILE, cache)
-            return mins
-    except Exception:
-        pass
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            result = json.loads(resp.read().decode())
 
-    # ── Final fallback: road-factor haversine ─────────────────────────────
-    mins = _fallback_minutes(lat1, lon1, lat2, lon2)
-    cache[key] = mins
-    _save_json(ROUTECACHE_FILE, cache)
-    return mins
+        if result.get("status") != "OK":
+            return [], (f"Directions API status: {result.get('status')} — "
+                        f"{result.get('error_message', '')}")
+
+        coords = []
+        for leg in result["routes"][0]["legs"]:
+            for step in leg["steps"]:
+                decoded = _decode_polyline(step["polyline"]["points"])
+                if coords:
+                    decoded = decoded[1:]  # remove duplicate junction point
+                coords.extend(decoded)
+
+        return coords, None
+
+    except Exception as e:
+        return [], str(e)
 
 
-def route_leg_times(coord_seq: list, progress_cb=None) -> list:
+def _decode_polyline(encoded):
     """
-    Given [(lat,lon), ...] ordered stops (incl. start and camp at end),
-    returns driving minutes for each consecutive leg.
-    Uses OSRM with fallback estimate.
+    Decode a Google Maps encoded polyline string into a list of
+    {"lat": float, "lng": float} dicts.
     """
-    cache = _load_json(ROUTECACHE_FILE)
-    times = []
-    for i in range(len(coord_seq) - 1):
-        lat1, lon1 = coord_seq[i]
-        lat2, lon2 = coord_seq[i+1]
-        times.append(driving_minutes(lat1, lon1, lat2, lon2, cache))
-    return times
+    coords = []
+    index = 0
+    lat = 0
+    lng = 0
 
+    while index < len(encoded):
+        # Decode latitude delta
+        result = 0
+        shift = 0
+        while True:
+            b = ord(encoded[index]) - 63
+            index += 1
+            result |= (b & 0x1f) << shift
+            shift += 5
+            if b < 0x20:
+                break
+        lat += ~(result >> 1) if (result & 1) else (result >> 1)
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Geocoding  (OpenStreetMap Nominatim — free, no key)
-# ─────────────────────────────────────────────────────────────────────────────
+        # Decode longitude delta
+        result = 0
+        shift = 0
+        while True:
+            b = ord(encoded[index]) - 63
+            index += 1
+            result |= (b & 0x1f) << shift
+            shift += 5
+            if b < 0x20:
+                break
+        lng += ~(result >> 1) if (result & 1) else (result >> 1)
 
-# Pennsylvania geographic bounds — used to validate geocoding results
-PA_LAT = (39.7, 42.3)
-PA_LON = (-80.5, -74.7)
+        coords.append({"lat": lat / 1e5, "lng": lng / 1e5})
 
-def _in_pa(lat: float, lon: float) -> bool:
-    return PA_LAT[0] <= lat <= PA_LAT[1] and PA_LON[0] <= lon <= PA_LON[1]
+    return coords
 
+# ── Download ───────────────────────────────────────────────────────────────────
 
-# Known approximate ZIP code centroids for SE Pennsylvania.
-# Used to validate geocoding results — if Nominatim returns a point
-# more than MAX_ZIP_DEVIATION_MI from the expected ZIP centroid,
-# it's treated as a wrong result and retried.
-# This catches cases like "108 Country Ln, Lansdale, PA 19446" resolving
-# to a "Country Ln" in another state or county.
-MAX_ZIP_DEVIATION_MI = 3.0   # max acceptable distance from ZIP centroid
+@app.route("/api/download/<job_id>")
+def api_download(job_id: str):
+    with jobs_lock:
+        job = jobs.get(job_id)
+    if not job or job["status"] != "done":
+        return jsonify({"error": "File not ready"}), 404
+    return send_file(
+        job["output_path"],
+        as_attachment=True,
+        download_name="elbow_lane_routes.xlsx",
+        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
 
-# These are rough ZIP centroids for areas around the camp.
-# Any PA address not in this table falls back to PA-bounds-only validation.
-ZIP_CENTROIDS = {
-    "18901": (40.310, -75.130), "18902": (40.281, -75.095),
-    "18914": (40.286, -75.207), "18929": (40.250, -75.084),
-    "18954": (40.217, -74.999), "18974": (40.231, -75.062),
-    "18976": (40.245, -75.141), "19002": (40.157, -75.228),
-    "19025": (40.139, -75.177), "19040": (40.181, -75.106),
-    "19044": (40.190, -75.126), "19090": (40.149, -75.120),
-    "19446": (40.241, -75.284), "19002": (40.157, -75.228),
+# ── HTML ───────────────────────────────────────────────────────────────────────
+
+HTML = r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+<meta http-equiv="Pragma" content="no-cache">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🚌</text></svg>">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Elbow Lane — Bus Route Optimizer</title>
+<script>
+window.GOOGLE_MAPS_KEY = "{{ google_maps_key }}";
+</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Roboto+Slab:wght@600;700;800&family=DM+Sans:ital,wght@0,300;0,400;0,500;0,600;1,400&display=swap" rel="stylesheet">
+<style>
+:root {
+--brand: #6D1F2F;
+--brand-dark: #4a1520;
+--brand-mid: #9e3347;
+--brand-light:#f5e6e9;
+--gold: #c9a84c;
+--gold-lt: #f0d98a;
+--ink: #1a1018;
+--mist: #f8f4f5;
+--border: #e8dde0;
+--success: #2d6a4f;
+--warn: #b36a00;
+--r: 12px;
+}
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+body{font-family:'DM Sans',sans-serif;background:var(--mist);color:var(--ink);min-height:100vh}
+header{background:var(--brand);color:#fff;padding:0 2rem;display:flex;align-items:center;gap:1.25rem;height:80px;box-shadow:0 2px 16px rgba(109,31,47,.35);position:sticky;top:0;z-index:200}
+.h-logo{width:60px;height:60px;flex-shrink:0;border-radius:50%;background-image:url("data:image/png;base64,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");background-size:90%;background-position:center;background-repeat:no-repeat;background-color:var(--brand-dark)}
+.h-title{font-family:'Roboto Slab',serif;font-size:1.25rem;font-weight:700;letter-spacing:.02em;text-transform:uppercase}
+.h-sub{font-size:.72rem;opacity:.75;font-weight:400;margin-top:2px;letter-spacing:.08em;text-transform:uppercase}
+.h-badge{margin-left:auto;background:rgba(255,255,255,.15);border:1px solid rgba(255,255,255,.3);color:#fff;font-size:.68rem;font-family:'Roboto Slab',serif;font-weight:500;letter-spacing:.12em;text-transform:uppercase;padding:.35rem .9rem;border-radius:20px;white-space:nowrap}
+.tab-bar{display:flex;background:#fff;border-bottom:2px solid var(--border);position:sticky;top:80px;z-index:100}
+.tab{padding:.85rem 1.75rem;font-size:.82rem;font-weight:500;font-family:'Roboto Slab',serif;letter-spacing:.07em;text-transform:uppercase;color:#999;cursor:pointer;border-bottom:3px solid transparent;margin-bottom:-2px;transition:color .15s,border-color .15s;white-space:nowrap;display:flex;align-items:center;gap:.5rem}
+.tab:hover{color:var(--brand-mid)}
+.tab.active{color:var(--brand);border-bottom-color:var(--brand)}
+.tab-badge{background:var(--brand);color:#fff;font-size:.65rem;font-weight:700;padding:.15rem .45rem;border-radius:10px;min-width:18px;text-align:center}
+.container{max-width:960px;margin:0 auto;padding:2rem 1.5rem 4rem}
+.tab-panel{display:none}.tab-panel.active{display:block}
+.card{background:#fff;border:1px solid var(--border);border-radius:var(--r);padding:1.5rem 1.75rem;margin-bottom:1.1rem;box-shadow:0 1px 4px rgba(0,0,0,.04);transition:box-shadow .2s}
+.card:hover{box-shadow:0 3px 12px rgba(109,31,47,.07)}
+.card-hd{display:flex;align-items:center;gap:.7rem;margin-bottom:1.1rem}
+.card-num{width:26px;height:26px;background:var(--brand);color:#fff;border-radius:50%;font-size:.75rem;font-weight:700;display:flex;align-items:center;justify-content:center;flex-shrink:0}
+.card-title{font-family:'Roboto Slab',serif;font-size:1.05rem;font-weight:700;color:var(--brand-dark);letter-spacing:.01em;text-transform:uppercase}
+.card-hint{font-size:.75rem;color:#999;margin-top:.15rem;font-weight:300}
+label.lbl{display:block;font-size:.75rem;font-weight:600;color:var(--brand-dark);letter-spacing:.04em;text-transform:uppercase;margin-bottom:.4rem}
+.drop-zone{border:2px dashed var(--border);border-radius:var(--r);padding:1.75rem;text-align:center;cursor:pointer;transition:all .2s;background:var(--mist);position:relative}
+.drop-zone:hover,.drop-zone.drag-over{border-color:var(--brand-mid);background:var(--brand-light)}
+.drop-zone input[type=file]{position:absolute;inset:0;opacity:0;cursor:pointer;width:100%;height:100%}
+.drop-icon{font-size:2rem;margin-bottom:.4rem}
+.drop-text{font-size:.88rem;color:#666}.drop-text strong{color:var(--brand)}
+.drop-meta{font-size:.72rem;color:#bbb;margin-top:.3rem}
+.file-chosen{display:none;align-items:center;gap:.7rem;padding:.65rem .9rem;background:#edfaf3;border:1px solid #a3d9b8;border-radius:8px;margin-top:.6rem;font-size:.83rem;color:var(--success);font-weight:500}
+.file-chosen.visible{display:flex}
+.file-chosen .rm{margin-left:auto;cursor:pointer;font-size:.9rem;color:#999;background:none;border:none;padding:0 .2rem}
+.fleet-builder{display:flex;flex-direction:column;gap:.6rem}
+.fleet-row{display:grid;grid-template-columns:110px 1fr 120px auto;gap:.6rem;align-items:center;background:var(--mist);border:1px solid var(--border);border-radius:8px;padding:.6rem .8rem;transition:background .15s}
+.fleet-row:hover{background:var(--brand-light)}
+.fleet-row select,.fleet-row input{border:1.5px solid var(--border);border-radius:6px;padding:.45rem .6rem;font-size:.83rem;font-family:'DM Sans',sans-serif;color:var(--ink);background:#fff;transition:border-color .15s;width:100%}
+.fleet-row select:focus,.fleet-row input:focus{outline:none;border-color:var(--brand-mid);background:#fff}
+.fleet-row .rm-row{background:none;border:none;cursor:pointer;color:#bbb;font-size:1.1rem;padding:.2rem;line-height:1;transition:color .15s;flex-shrink:0}
+.fleet-row .rm-row:hover{color:var(--brand)}
+.fleet-col-label{font-size:.7rem;font-weight:600;color:#999;letter-spacing:.05em;text-transform:uppercase;margin-bottom:.3rem;display:grid;grid-template-columns:110px 1fr 120px 32px;gap:.6rem;padding:0 .8rem}
+.add-vehicle-btn{display:flex;align-items:center;gap:.5rem;padding:.6rem 1.1rem;background:none;border:1.5px dashed var(--border);border-radius:8px;color:var(--brand-mid);font-size:.83rem;font-weight:600;cursor:pointer;transition:all .15s;width:100%;justify-content:center;margin-top:.2rem}
+.add-vehicle-btn:hover{border-color:var(--brand-mid);background:var(--brand-light)}
+.fleet-summary{display:flex;gap:.75rem;flex-wrap:wrap;margin-top:.75rem}
+.fleet-chip{background:var(--brand-light);border:1px solid #d4a0aa;border-radius:20px;padding:.3rem .85rem;font-size:.75rem;font-weight:500;color:var(--brand-dark)}
+.trip-btn{padding:.5rem 1.25rem;border:1.5px solid var(--border);border-radius:8px;background:#fff;color:#888;font-family:'Roboto Slab',serif;font-size:.78rem;font-weight:600;letter-spacing:.04em;text-transform:uppercase;cursor:pointer;transition:all .15s;white-space:nowrap}
+.trip-btn.active{background:var(--brand);border-color:var(--brand);color:#fff}
+.trip-btn:hover:not(.active){border-color:var(--brand-mid);color:var(--brand-mid)}
+.run-btn{width:100%;padding:.95rem 2rem;background:var(--brand);color:#fff;border:none;border-radius:var(--r);font-family:'Roboto Slab',serif;font-size:1.05rem;font-weight:700;letter-spacing:.02em;text-transform:uppercase;cursor:pointer;display:flex;align-items:center;justify-content:center;gap:.65rem;transition:background .18s,transform .1s,box-shadow .18s;box-shadow:0 4px 14px rgba(109,31,47,.3);margin-top:1.25rem}
+.run-btn:hover:not(:disabled){background:var(--brand-dark);box-shadow:0 6px 20px rgba(109,31,47,.4);transform:translateY(-1px)}
+.run-btn:disabled{opacity:.55;cursor:not-allowed;transform:none;box-shadow:none}
+#prog-panel{display:none;background:#1a1018;border-radius:var(--r);padding:1.1rem 1.4rem;margin-top:1.1rem;border:1px solid #2d1e24}
+#prog-panel.visible{display:block}
+.prog-hd{display:flex;align-items:center;gap:.65rem;margin-bottom:.75rem;padding-bottom:.65rem;border-bottom:1px solid #2d1e24}
+.prog-title{font-size:.82rem;font-weight:600;color:#e0d4d8;letter-spacing:.06em;text-transform:uppercase}
+.spinner{width:15px;height:15px;border:2px solid rgba(255,255,255,.15);border-top-color:var(--gold);border-radius:50%;animation:spin .7s linear infinite;flex-shrink:0}
+@keyframes spin{to{transform:rotate(360deg)}}
+.pbar-wrap{background:rgba(255,255,255,.08);border-radius:4px;height:3px;margin-bottom:.65rem;overflow:hidden}
+.pbar{height:100%;background:linear-gradient(90deg,var(--brand-mid),var(--gold));width:0%;transition:width .4s ease}
+#log{font-family:monospace;font-size:.76rem;line-height:1.65;color:#c4b5bb;max-height:220px;overflow-y:auto}
+#log .ok{color:#6fcf97}#log .warn{color:#f2c94c}#log .err{color:#eb5757}
+.action-bar{display:flex;gap:.75rem;flex-wrap:wrap;margin-top:1.1rem}
+.dl-btn{display:inline-flex;align-items:center;gap:.55rem;padding:.75rem 1.5rem;background:var(--gold);color:#1a1018;border-radius:8px;text-decoration:none;font-weight:700;font-size:.9rem;transition:background .15s,transform .1s;box-shadow:0 3px 10px rgba(201,168,76,.35);border:none;cursor:pointer}
+.dl-btn:hover{background:var(--gold-lt);transform:translateY(-1px)}
+.view-btn{display:inline-flex;align-items:center;gap:.55rem;padding:.75rem 1.5rem;background:var(--brand);color:#fff;border-radius:8px;font-weight:600;font-size:.9rem;border:none;cursor:pointer;transition:background .15s}
+.view-btn:hover{background:var(--brand-dark)}
+#error-card{display:none;background:#2d0d13;border:1px solid #6d1f2f;border-radius:var(--r);padding:1.1rem 1.4rem;margin-top:1.1rem;color:#f5c2cb;font-size:.85rem}
+#error-card.visible{display:block}
+#error-card strong{display:block;margin-bottom:.35rem;font-size:.95rem}
+.results-empty{text-align:center;padding:4rem 2rem;color:#bbb}
+.unassigned-tray{background:#fff8e6;border:1.5px dashed var(--gold);border-radius:var(--r);padding:1rem 1.25rem;margin-bottom:1rem;display:none}
+.unassigned-tray.visible{display:block}
+.unassigned-title{font-family:'Roboto Slab',serif;font-size:.85rem;font-weight:700;color:#7a4f00;margin-bottom:.65rem;text-transform:uppercase;letter-spacing:.04em}
+.unassigned-list{display:flex;flex-wrap:wrap;gap:.5rem;margin-bottom:.75rem}
+.unassigned-chip{display:flex;align-items:center;gap:.4rem;background:#fff3cd;border:1px solid #f0c060;border-radius:20px;padding:.3rem .75rem;font-size:.78rem;font-weight:500;color:#7a4f00}
+.unassigned-chip select{border:none;background:transparent;font-size:.75rem;color:#7a4f00;cursor:pointer;padding:0 .2rem;font-weight:600}
+.reassign-btn{padding:.25rem .65rem;background:var(--brand);color:#fff;border:none;border-radius:6px;font-size:.72rem;font-weight:600;cursor:pointer;transition:background .15s}
+.reassign-btn:hover{background:var(--brand-dark)}
+.recalc-bar{display:none;align-items:center;gap:.75rem;padding:.65rem 1rem;background:#edfaf3;border:1px solid #a3d9b8;border-radius:8px;margin-bottom:.75rem;font-size:.82rem;color:var(--success)}
+.recalc-bar.visible{display:flex}
+.results-empty .empty-icon{font-size:3rem;margin-bottom:1rem}
+.results-empty p{font-size:.9rem;line-height:1.6}
+.summary-table{width:100%;border-collapse:collapse;font-size:.83rem}
+.summary-table th{background:var(--brand);color:#fff;padding:.6rem .9rem;text-align:left;font-family:'Roboto Slab',serif;font-weight:500;font-size:.82rem;letter-spacing:.08em;text-transform:uppercase}
+.summary-table th:first-child{border-radius:6px 0 0 0}
+.summary-table th:last-child{border-radius:0 6px 0 0}
+.summary-table td{padding:.6rem .9rem;border-bottom:1px solid var(--border);vertical-align:middle}
+.summary-table tr:last-child td{border-bottom:none}
+.summary-table tr:nth-child(even) td{background:var(--mist)}
+.summary-table tr.warn td{background:#fff8e6}
+.util-bar-wrap{background:#eee;border-radius:4px;height:8px;width:80px;overflow:hidden;display:inline-block;vertical-align:middle;margin-right:.4rem}
+.util-bar{height:100%;border-radius:4px}
+.util-ok{background:#2d6a4f}
+.util-warn{background:#b36a00}
+.badge{display:inline-block;padding:.15rem .55rem;border-radius:10px;font-size:.7rem;font-weight:600}
+.badge-ok{background:#edfaf3;color:var(--success)}
+.badge-warn{background:#fff3cd;color:var(--warn)}
+.veh-list{display:flex;flex-direction:column;gap:.6rem;margin-top:1rem}
+.veh-card{background:#fff;border:1px solid var(--border);border-radius:var(--r);overflow:hidden;transition:box-shadow .2s}
+.veh-card:hover{box-shadow:0 3px 12px rgba(109,31,47,.08)}
+.veh-card.warn-card{border-color:#f0c060}
+.veh-header{display:flex;align-items:center;gap:1rem;padding:.9rem 1.1rem;cursor:pointer;user-select:none}
+.veh-header:hover{background:var(--mist)}
+.veh-name{font-family:'Roboto Slab',serif;font-size:1rem;font-weight:600;color:var(--brand-dark);min-width:90px;letter-spacing:.04em;text-transform:uppercase}
+.veh-corridor{font-size:.78rem;color:#888;flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.veh-stats{display:flex;align-items:center;gap:.75rem;margin-left:auto;flex-shrink:0}
+.veh-stat{font-size:.78rem;color:#666;white-space:nowrap}
+.veh-stat strong{color:var(--ink)}
+.veh-chevron{color:#bbb;transition:transform .2s;font-size:.85rem;flex-shrink:0}
+.veh-card.open .veh-chevron{transform:rotate(180deg)}
+.veh-body{display:none;padding:0 1.1rem 1.1rem;border-top:1px solid var(--border)}
+.veh-card.open .veh-body{display:block}
+.veh-map{width:100%;height:280px;border-radius:8px;margin-bottom:.9rem;border:1px solid var(--border);background:var(--mist);position:relative;z-index:1}
+.map-loading{display:flex;align-items:center;justify-content:center;height:100%;font-size:.82rem;color:#aaa;gap:.5rem}
+.stop-table{width:100%;border-collapse:collapse;font-size:.8rem;margin-top:.75rem}
+.stop-table th{font-size:.7rem;font-weight:600;color:#999;letter-spacing:.05em;text-transform:uppercase;padding:.4rem .6rem;border-bottom:2px solid var(--border);text-align:left}
+.stop-table td{padding:.55rem .6rem;border-bottom:1px solid #f0eaec;vertical-align:top}
+.stop-table tr:last-child td{border-bottom:none}
+.stop-table tr:hover td{background:var(--mist)}
+.stop-num{font-weight:700;color:var(--brand);width:40px}
+.stop-addr{font-weight:500;color:var(--ink)}
+.stop-city{font-size:.72rem;color:#999;margin-top:.1rem}
+.stop-riders{color:#555}
+.stop-time{color:#888;white-space:nowrap}
+.stop-row-start td,.stop-row-arrive td{background:var(--brand-light)!important}
+.rider-pill{display:inline-flex;align-items:center;gap:.25rem;background:var(--brand-light);color:var(--brand-dark);border-radius:10px;padding:.1rem .5rem;font-size:.72rem;font-weight:500;margin:.1rem .15rem .1rem 0}
+.rider-remove{background:none;border:none;cursor:pointer;color:var(--brand-mid);font-size:.75rem;line-height:1;padding:0;opacity:.6;transition:opacity .15s}
+.rider-remove:hover{opacity:1}
+.unassigned-pill{display:inline-flex;align-items:center;gap:.4rem;background:#fff3cd;border:1px solid #f0c060;border-radius:8px;padding:.3rem .7rem;font-size:.78rem;font-weight:500;color:#7a4f00}
+.unassigned-pill select{border:none;background:transparent;font-size:.75rem;color:#7a4f00;cursor:pointer;outline:none;font-family:'DM Sans',sans-serif}
+.unassigned-pill .assign-btn{background:var(--brand);color:#fff;border:none;border-radius:6px;padding:.2rem .55rem;font-size:.7rem;font-weight:600;cursor:pointer;transition:background .15s}
+.unassigned-pill .assign-btn:hover{background:var(--brand-dark)}
+.recalc-btn{display:inline-flex;align-items:center;gap:.5rem;padding:.6rem 1.25rem;background:#2d6a4f;color:#fff;border:none;border-radius:8px;font-family:'Roboto Slab',serif;font-size:.82rem;font-weight:600;cursor:pointer;transition:background .15s;letter-spacing:.03em;text-transform:uppercase}
+.recalc-btn:hover{background:#1e4f3a}
+.recalc-btn:disabled{opacity:.5;cursor:not-allowed}
+.edit-bar{display:flex;align-items:center;gap:.75rem;margin-bottom:.75rem;flex-wrap:wrap}
+.edit-hint{font-size:.75rem;color:#999;font-style:italic}
+.stop-row-start .stop-num{color:var(--brand-mid)}
+.stop-row-arrive .stop-num{color:var(--success);font-weight:700}
+.stop-row-arrive .stop-time{color:var(--success);font-weight:600}
+.rider-pill{display:inline-block;background:var(--brand-light);color:var(--brand-dark);border-radius:10px;padding:.1rem .5rem;font-size:.72rem;font-weight:500;margin:.1rem .15rem .1rem 0}
+.summary-totals{background:var(--brand)!important;color:#fff}
+.summary-totals td{color:#fff!important;font-weight:700;border-bottom:none!important}
+@media(max-width:640px){
+.fleet-row{grid-template-columns:1fr 1fr;grid-template-rows:auto auto}
+.fleet-col-label{display:none}
+.veh-stats{display:none}
+.tab span:not(.tab-badge){display:none}
+header{padding:0 1rem;gap:.75rem;height:64px}
+.h-logo{width:46px;height:46px}
+.h-title{font-size:1rem}
+.h-sub{display:none}
+.h-badge{display:none}
+.container{padding:1rem .75rem 3rem}
+.card{padding:1.1rem 1rem}
+.trip-settings-grid{grid-template-columns:1fr !important;gap:.75rem}
+.trip-btn{padding:.6rem .9rem;font-size:.75rem}
+.run-btn{font-size:.95rem}
+.summary-table{font-size:.72rem}
+.summary-table th,.summary-table td{padding:.4rem .5rem}
+.veh-header{flex-wrap:wrap;gap:.5rem}
+.veh-corridor{display:none}
+}
+</style>
+</head>
+<body>
+<header>
+<div class="h-logo" role="img" aria-label="Elbow Lane Day Camp"></div>
+<div>
+<div class="h-title">Elbow Lane Day Camp</div>
+<div class="h-sub">Bus Route Optimizer</div>
+</div>
+<span class="h-badge">Route Planner</span>
+</header>
+<div class="tab-bar">
+<div class="tab active" data-tab="setup">⚙️ <span>Setup</span></div>
+<div class="tab" data-tab="results">📊 <span>Results</span> <span class="tab-badge" id="results-badge" style="display:none">0</span></div>
+</div>
+<div class="container">
+<!-- SETUP TAB -->
+<div class="tab-panel active" id="tab-setup">
+<div class="card">
+<div class="card-hd">
+<span class="card-num" style="background:var(--gold);color:#1a1018">★</span>
+<div>
+<div class="card-title">Trip Settings</div>
+<div class="card-hint">Set the camp location and whether this is a morning or afternoon run</div>
+</div>
+</div>
+<div class="trip-settings-grid" style="display:grid;grid-template-columns:1fr auto;gap:1rem;align-items:start">
+<div>
+<label class="lbl" for="camp-address">Camp Address</label>
+<input type="text" id="camp-address"
+value="828 Elbow Lane, Warrington, PA 18976"
+placeholder="828 Elbow Lane, Warrington, PA 18976"
+style="width:100%;padding:.6rem .85rem;border:1.5px solid var(--border);border-radius:8px;font-family:'DM Sans',sans-serif;font-size:.85rem;color:var(--ink);background:var(--mist);transition:border-color .15s;box-sizing:border-box"
+onfocus="this.style.borderColor='var(--brand-mid)';this.style.background='#fff'"
+onblur="this.style.borderColor='var(--border)';this.style.background='var(--mist)'">
+<div style="font-size:.72rem;color:#aaa;margin-top:.35rem">This is the destination for morning routes and the starting point for afternoon routes</div>
+</div>
+<div>
+<label class="lbl">Trip Direction</label>
+<div style="display:flex;gap:.5rem">
+<button class="trip-btn active" id="btn-morning" onclick="setTrip('morning')">Morning</button>
+<button class="trip-btn" id="btn-afternoon" onclick="setTrip('afternoon')">Afternoon</button>
+</div>
+<div id="trip-hint" style="font-size:.72rem;color:#aaa;margin-top:.35rem;max-width:160px">Students travel <strong>to camp</strong></div>
+</div>
+</div>
+</div>
+<div class="card">
+<div class="card-hd">
+<span class="card-num">1</span>
+<div>
+<div class="card-title" id="roster-title">Morning Roster</div>
+<div class="card-hint">Upload the CSV exported from your camp management software</div>
+</div>
+</div>
+<div class="drop-zone" id="drop-zone">
+<input type="file" id="csv-file" accept=".csv">
+<div class="drop-icon">📋</div>
+<div class="drop-text"><strong>Click to choose</strong> or drag &amp; drop your CSV file</div>
+<div class="drop-meta">Required columns: Last name | First name | Address | City | Zip</div>
+</div>
+<div class="file-chosen" id="file-chosen">
+<span>✅</span>
+<span id="file-name">—</span>
+<span id="file-rows" style="color:#888;font-weight:400"></span>
+<button class="rm" id="remove-file">✕</button>
+</div>
+</div>
+<div class="card">
+<div class="card-hd">
+<span class="card-num">2</span>
+<div>
+<div class="card-title">Fleet Configuration</div>
+<div class="card-hint">Add each vehicle, its starting address, and capacity</div>
+</div>
+</div>
+<div class="fleet-col-label">
+<span>Vehicle</span><span>Starting Address</span><span>Capacity</span><span></span>
+</div>
+<div class="fleet-builder" id="fleet-builder"></div>
+<button class="add-vehicle-btn" id="add-vehicle-btn">＋ Add Vehicle</button>
+<div class="fleet-summary" id="fleet-summary"></div>
+<div id="capacity-warning" style="display:none;margin-top:.75rem;background:#fff3cd;border:1px solid #f0c060;border-radius:8px;padding:.75rem 1rem;font-size:.84rem;color:#7a4f00;align-items:center;gap:.6rem">
+<span style="font-size:1.1rem">⚠️</span>
+<span id="capacity-warning-msg"></span>
+</div>
+</div>
+<button class="run-btn" id="run-btn" disabled>
+<span id="run-icon">🗺️</span>
+<span id="run-label">Generate Route Plan</span>
+</button>
+<div id="prog-panel">
+<div class="prog-hd">
+<div class="spinner" id="spinner"></div>
+<span class="prog-title" id="prog-title">Optimizing routes…</span>
+</div>
+<div class="pbar-wrap"><div class="pbar" id="pbar"></div></div>
+<div id="log"></div>
+</div>
+<div class="action-bar" id="action-bar" style="display:none">
+<a class="dl-btn" id="dl-link" href="#" download>⬇ Download Excel</a>
+<button class="view-btn" id="view-results-btn">📊 View Results</button>
+</div>
+<div id="cache-notice" style="display:none;margin-top:.6rem;background:#fff3cd;border:1px solid #f0c060;border-radius:8px;padding:.6rem 1rem;font-size:.78rem;color:#7a4f00">
+✅ Cache cleared — next run will re-geocode all addresses with Google Maps.
+</div>
+<div style="text-align:right;margin-top:.4rem">
+<button onclick="clearCache()" style="background:none;border:none;color:#aaa;font-size:.72rem;cursor:pointer;text-decoration:underline">Clear geocache (fixes wrong map locations)</button>
+</div>
+<div id="error-card">
+<strong>Something went wrong</strong>
+<span id="error-msg"></span>
+</div>
+</div><!-- /setup tab -->
+
+<!-- RESULTS TAB -->
+<div class="tab-panel" id="tab-results">
+<div id="results-empty" class="results-empty">
+<div class="empty-icon">🗺️</div>
+<p>No routes generated yet.<br>Go to <strong>Setup</strong> and click <em>Generate Route Plan</em>.</p>
+</div>
+<div id="results-stale" style="display:none">
+<div style="background:var(--brand-light);border:1px solid #d4a0aa;border-radius:8px;padding:.6rem 1rem;font-size:.78rem;color:var(--brand-dark);margin-bottom:1rem;display:flex;align-items:center;gap:.5rem">
+<span>📋</span>
+<span>Showing results from your last run on <strong id="last-run-date"></strong> — generate a new plan to update</span>
+</div>
+</div>
+<div id="results-content" style="display:none">
+<div class="card" id="summary-card">
+<div class="card-hd">
+<span style="font-size:1.3rem">📊</span>
+<div>
+<div class="card-title">Route Summary</div>
+<div class="card-hint" id="summary-hint"></div>
+</div>
+<a class="dl-btn" id="dl-link-2" href="#" download style="margin-left:auto;padding:.5rem 1rem;font-size:.8rem">⬇ Excel</a>
+</div>
+<div style="overflow-x:auto">
+<table class="summary-table" id="summary-table">
+<thead>
+<tr>
+<th>Vehicle</th>
+<th>Route Corridor</th>
+<th>Riders</th>
+<th>Utilization</th>
+<th>Stops</th>
+<th>Kids Ride Time</th>
+<th>Distance</th>
+</tr>
+</thead>
+<tbody id="summary-tbody"></tbody>
+</table>
+</div>
+</div>
+<div class="recalc-bar" id="recalc-bar">
+<span>✏️ You have unsaved changes — recalculate to update times and Excel</span>
+<button class="recalc-btn" id="recalc-btn" onclick="recalculate()">Recalculate Routes</button>
+</div>
+<div class="unassigned-tray" id="unassigned-tray">
+<div class="unassigned-title">⚠ Unassigned Students</div>
+<div class="unassigned-list" id="unassigned-list"></div>
+</div>
+<div class="veh-list" id="veh-list"></div>
+</div>
+</div><!-- /results tab -->
+</div><!-- /container -->
+
+<script>
+const VEHICLE_NAMES = ['Vehicle A','Vehicle B','Vehicle C','Vehicle D','Vehicle E',
+'Vehicle F','Vehicle G','Vehicle H','Vehicle I','Vehicle J','Vehicle K','Vehicle L'];
+const CAPACITIES = [3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,24,26,28,30,40,50];
+const DEFAULT_FLEET = [
+  {name:'Vehicle A', address:'', capacity:5},
+  {name:'Vehicle B', address:'', capacity:13},
+];
+
+let csvFile = null;
+let currentJobId = null;
+let pollTimer = null;
+let lastLineCount = 0;
+let routeData = null;
+
+// Tabs
+document.querySelectorAll('.tab').forEach(tab => {
+  tab.addEventListener('click', () => {
+    document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+    document.querySelectorAll('.tab-panel').forEach(p => p.classList.remove('active'));
+    tab.classList.add('active');
+    document.getElementById('tab-' + tab.dataset.tab).classList.add('active');
+  });
+});
+
+// Fleet Builder
+const builder = document.getElementById('fleet-builder');
+let fleet = JSON.parse(JSON.stringify(DEFAULT_FLEET));
+
+function renderFleet() {
+  builder.innerHTML = '';
+  fleet.forEach((veh, i) => {
+    const row = document.createElement('div');
+    row.className = 'fleet-row';
+    row.innerHTML = `
+      <select data-idx="${i}" data-field="name">
+        ${VEHICLE_NAMES.map(n => `<option value="${n}" ${n===veh.name?'selected':''}>${n}</option>`).join('')}
+      </select>
+      <input type="text" placeholder="e.g. 828 Elbow Lane, Warrington, PA"
+        value="${veh.address}" data-idx="${i}" data-field="address">
+      <select data-idx="${i}" data-field="capacity">
+        ${CAPACITIES.map(c => `<option value="${c}" ${c===veh.capacity?'selected':''}>${c} riders</option>`).join('')}
+      </select>
+      <button class="rm-row" data-idx="${i}" title="Remove">✕</button>
+    `;
+    builder.appendChild(row);
+  });
+  updateFleetSummary();
+  updateRunBtn();
 }
 
-
-def _extract_zip5(address: str) -> str:
-    """Extract 5-digit ZIP from address string."""
-    m_zip = re.search(r"\b(\d{5})(?:-\d{4})?\b", address)
-    return m_zip.group(1) if m_zip else ""
-
-
-def _result_near_zip(lat: float, lon: float, zip5: str) -> bool:
-    """Return True if coords are plausibly close to the expected ZIP centroid."""
-    if zip5 not in ZIP_CENTROIDS:
-        return True   # can't validate — give benefit of the doubt
-    clat, clon = ZIP_CENTROIDS[zip5]
-    return haversine_mi(lat, lon, clat, clon) <= MAX_ZIP_DEVIATION_MI
-
-
-def _geocode_one(address: str, cache: dict, progress_cb=None) -> tuple:
-    """
-    Geocode one address using Google Geocoding API (primary) with
-    Nominatim as fallback if Google is unavailable.
-
-    Results are validated against Pennsylvania bounds and ZIP centroid
-    proximity regardless of which service returns them.
-    """
-    key = address.strip().lower()
-
-    # Override file always wins
-    overrides = _load_overrides()
-    if key in overrides:
-        lat, lon = float(overrides[key][0]), float(overrides[key][1])
-        cache[key] = [lat, lon]
-        return lat, lon
-
-    if key in cache:
-        cached = tuple(cache[key])
-        zip5_check = _extract_zip5(address)
-        if (_in_pa(*cached)
-                and cached != CAMP_COORDS
-                and _result_near_zip(*cached, zip5_check)):
-            return cached
-        # Bad cached entry — purge it and stale route times
-        if progress_cb:
-            progress_cb(f"  Clearing bad cached coord for {address}: {cached}")
-        rcache = _load_json(ROUTECACHE_FILE)
-        bad_prefix = f"{cached[0]:.5f},{cached[1]:.5f}"
-        stale = [k for k in rcache if bad_prefix in k]
-        for k in stale:
-            del rcache[k]
-        if stale:
-            _save_json(ROUTECACHE_FILE, rcache)
-        del cache[key]
-
-    if progress_cb:
-        progress_cb(f"  Geocoding: {address}")
-
-    zip5  = _extract_zip5(address)
-    parts = [p.strip() for p in address.split(",")]
-    street = parts[0] if parts else address
-    city   = parts[1] if len(parts) > 1 else ""
-
-    def _validate(lat, lon) -> bool:
-        return _in_pa(lat, lon) and _result_near_zip(lat, lon, zip5)
-
-    result = None
-
-    # ── Pass 1: Google Geocoding API ──────────────────────────────────────
-    if GOOGLE_MAPS_KEY:
-        try:
-            params = urllib.parse.urlencode({
-                "address":    address,
-                "components": "country:US|administrative_area:PA",
-                "key":        GOOGLE_MAPS_KEY,
-            })
-            url = f"https://maps.googleapis.com/maps/api/geocode/json?{params}"
-            req = urllib.request.Request(url,
-                headers={"User-Agent": "ElbowLaneCampBusRouter/1.0"})
-            with urllib.request.urlopen(req, timeout=8) as resp:
-                data = json.loads(resp.read().decode())
-            if data.get("status") == "OK" and data.get("results"):
-                loc = data["results"][0]["geometry"]["location"]
-                lat, lon = float(loc["lat"]), float(loc["lng"])
-                if _validate(lat, lon):
-                    result = (lat, lon)
-                elif progress_cb:
-                    progress_cb(f"  ⚠ Google result out of PA bounds for {address} — trying Nominatim")
-        except Exception as e:
-            if progress_cb:
-                progress_cb(f"  ⚠ Google geocode error: {e}")
-
-    # ── Pass 2: Nominatim structured (fallback) ───────────────────────────
-    if result is None:
-        try:
-            params = urllib.parse.urlencode({
-                "street":  street,
-                "city":    city,
-                "state":   "Pennsylvania",
-                "country": "United States",
-                "format":  "json",
-                "limit":   3,
-                "addressdetails": 0,
-            })
-            req = urllib.request.Request(
-                f"https://nominatim.openstreetmap.org/search?{params}",
-                headers={"User-Agent": "ElbowLaneCampBusRouter/1.0"})
-            with urllib.request.urlopen(req, timeout=10) as resp:
-                results = json.loads(resp.read().decode())
-            time.sleep(1.1)
-            for r in results:
-                lat, lon = float(r["lat"]), float(r["lon"])
-                if _validate(lat, lon):
-                    result = (lat, lon)
-                    break
-        except Exception:
-            pass
-
-    # ── Pass 3: Nominatim hard-bounded free-text ──────────────────────────
-    if result is None:
-        try:
-            params = urllib.parse.urlencode({
-                "q":       address,
-                "format":  "json",
-                "limit":   5,
-                "addressdetails": 0,
-                "viewbox": "-80.5,39.7,-74.7,42.3",
-                "bounded": 1,
-            })
-            req = urllib.request.Request(
-                f"https://nominatim.openstreetmap.org/search?{params}",
-                headers={"User-Agent": "ElbowLaneCampBusRouter/1.0"})
-            with urllib.request.urlopen(req, timeout=10) as resp:
-                results = json.loads(resp.read().decode())
-            time.sleep(1.1)
-            for r in results:
-                lat, lon = float(r["lat"]), float(r["lon"])
-                if _validate(lat, lon):
-                    result = (lat, lon)
-                    break
-        except Exception:
-            pass
-
-    # ── Pass 4: ZIP centroid fallback ─────────────────────────────────────
-    if result is None and zip5 in ZIP_CENTROIDS:
-        lat, lon = ZIP_CENTROIDS[zip5]
-        if progress_cb:
-            progress_cb(f"  ⚠ Using ZIP centroid for '{address}' — may be approximate")
-        result = (lat, lon)
-
-    if result is not None:
-        lat, lon = result
-        cache[key] = [lat, lon]
-        _save_json(GEOCACHE_FILE, cache)
-        if progress_cb:
-            progress_cb(f"  ✓ {address} → ({lat:.4f}, {lon:.4f})")
-        return lat, lon
-
-    if progress_cb:
-        progress_cb(f"  ⚠ Could not geocode '{address}' — using camp coords as fallback")
-    return CAMP_COORDS
-
-
-def _purge_bad_geocache(cache: dict, addresses: list, progress_cb=None) -> int:
-    """
-    Scan the geocache for entries with coordinates that fail ZIP validation.
-    Removes them so they will be re-geocoded correctly on the next run.
-    Called automatically at the start of every geocode_all_addresses call.
-    Returns number of bad entries removed.
-    """
-    rcache = _load_json(ROUTECACHE_FILE)
-    removed = 0
-    for addr in addresses:
-        key = addr.strip().lower()
-        if key not in cache:
-            continue
-        cached = tuple(cache[key])
-        zip5 = _extract_zip5(addr)
-        is_bad = (
-            cached == CAMP_COORDS
-            or not _in_pa(*cached)
-            or not _result_near_zip(*cached, zip5)
-        )
-        if is_bad:
-            # Also wipe any route-time cache entries that used these bad coords
-            bad_prefix = f"{cached[0]:.5f},{cached[1]:.5f}"
-            stale_routes = [k for k in rcache if bad_prefix in k]
-            for k in stale_routes:
-                del rcache[k]
-            del cache[key]
-            removed += 1
-            if progress_cb:
-                progress_cb(f"  Purged bad geocache entry: {addr} was {cached}")
-    if removed:
-        _save_json(GEOCACHE_FILE, cache)
-        _save_json(ROUTECACHE_FILE, rcache)
-    return removed
-
-
-def geocode_all_addresses(addresses: list, progress_cb=None) -> dict:
-    """
-    Geocode a list of addresses → {address: (lat, lon)}.
-
-    Fully self-healing — no manual cache management needed:
-    • Scans and purges any cached coordinates that fail ZIP-centroid validation
-    • This automatically fixes bad Nominatim results from previous runs
-    • Addresses geocoded correctly are returned instantly from cache
-    • New/purged addresses are re-geocoded using the 4-pass robust strategy
-    • First run: ~1 second per new address (Nominatim rate limit)
-    • Subsequent runs: instant (unless previous results were bad)
-    """
-    cache = _load_json(GEOCACHE_FILE)
-
-    # Always purge bad entries first — fixes stale wrong coords automatically
-    purged = _purge_bad_geocache(cache, addresses, progress_cb)
-    if purged and progress_cb:
-        progress_cb(f"  Purged {purged} bad geocache entries — will re-geocode")
-
-    # Find addresses that still need geocoding after purge
-    def needs_geocode(a: str) -> bool:
-        key = a.strip().lower()
-        if key not in cache:
-            return True
-        cached = tuple(cache[key])
-        if cached == CAMP_COORDS or not _in_pa(*cached):
-            return True
-        zip5 = _extract_zip5(a)
-        return not _result_near_zip(*cached, zip5)
-
-    # Identify addresses with bad cached coords so we can also
-    # wipe their stale route-time cache entries
-    bad_addresses = [a for a in addresses if needs_geocode(a)
-                     and a.strip().lower() in cache]
-
-    if bad_addresses:
-        # Remove stale route-cache entries for these addresses
-        rcache = _load_json(ROUTECACHE_FILE)
-        removed_routes = 0
-        for addr in bad_addresses:
-            old_key = cache.get(addr.strip().lower())
-            if old_key:
-                old_lat, old_lon = old_key[0], old_key[1]
-                bad_coord_prefix = f"{old_lat:.5f},{old_lon:.5f}"
-                stale = [k for k in rcache if bad_coord_prefix in k]
-                for k in stale:
-                    del rcache[k]
-                    removed_routes += 1
-        if removed_routes:
-            _save_json(ROUTECACHE_FILE, rcache)
-            if progress_cb:
-                progress_cb(f"  Cleared {removed_routes} stale route-time entries "
-                            f"for re-geocoded addresses")
-
-    new_count = sum(1 for a in addresses if needs_geocode(a))
-    if new_count and progress_cb:
-        progress_cb(f"Geocoding {new_count} address(es) via OpenStreetMap "
-                    f"(validating Pennsylvania bounds)...")
-    elif progress_cb:
-        progress_cb(f"All {len(addresses)} addresses loaded from cache")
-
-    return {a: _geocode_one(a, cache, progress_cb) for a in addresses}
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# CSV parsing
-# ─────────────────────────────────────────────────────────────────────────────
-
-def parse_students_csv(csv_text: str) -> list:
-    if "\n" not in csv_text and len(csv_text) < 300:
-        try:
-            with open(csv_text, newline="", encoding="utf-8-sig") as f:
-                csv_text = f.read()
-        except FileNotFoundError:
-            pass
-    students = []
-    reader = csv.DictReader(io.StringIO(csv_text))
-    for row in reader:
-        row = {k.strip().strip('"'): v.strip().strip('"') for k, v in row.items()}
-        idx_key = next((k for k in row if k in ("", "idx", "#")), "")
-        try:    idx = int(row.get(idx_key, 0))
-        except: idx = 0
-        last  = (row.get("Last name")   or row.get("last_name")  or row.get("Last Name")  or "")
-        first = (row.get("First name")  or row.get("first_name") or row.get("First Name") or "")
-        addr  = (row.get("Primary family address 1") or row.get("Address") or
-                 row.get("address") or row.get("Street") or "")
-        city  = (row.get("Primary family city") or row.get("City") or row.get("city") or "")
-        zip_  = (row.get("Primary family zip")  or row.get("Zip")  or row.get("zip")
-                 or row.get("ZIP") or row.get("Postal Code") or "")
-        if last and addr:
-            students.append(Student(idx, last, first, addr, city, zip_))
-    return students
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Vehicle config parsing  (handles many messy real-world formats)
-# ─────────────────────────────────────────────────────────────────────────────
-
-def parse_vehicles_text(text: str) -> list:
-    """
-    Accepts formats like:
-        Vehicle A: Start: 7826 Loretto Ave, Philadelphia, PA - Capacity: 5 riders
-        Vehicle B Start: 12 Rachel Rd, Richboro, PA  Capacity: up to 13 riders
-        Vehicles D
-        Start: 1045 N West End Blvd, Quakertown PA - Capacity: up to 13 riders
-        E-H (5 vehicles)Start & End: 828 Elbow Lane - Capacity: up to 13 riders each
-    """
-    VEH_RE = re.compile(
-        r"""^(?:(?:vehicles?\s+[A-Z0-9][-\s,A-Z0-9]*)
-              |(?:[A-Z][-][A-Z]\s*(?:\(|$))
-              |(?:[A-Z]\s*(?:\(|:|\s+Start))
-              |(?:Van\s+[A-Z0-9]))""",
-        re.VERBOSE | re.IGNORECASE)
-
-    # Merge continuation lines
-    merged = []
-    for raw in text.strip().splitlines():
-        s = raw.strip()
-        if not s: continue
-        if merged and not VEH_RE.match(s):
-            merged[-1] += " " + s
-        else:
-            merged.append(s)
-
-    # Expand letter ranges  (e.g. "E-H" → Vehicle E, F, G, H)
-    RNG = re.compile(r"^(?:vehicles?\s*)?([A-Z])[-]([A-Z])(?:\s*\(\d+\s*vehicles?\))?",
-                     re.IGNORECASE)
-    expanded = []
-    for line in merged:
-        m = RNG.match(line)
-        if m:
-            remainder = line[m.end():].strip().lstrip(":")
-            for c in range(ord(m.group(1).upper()), ord(m.group(2).upper())+1):
-                expanded.append(f"Vehicle {chr(c)}: {remainder}")
-        else:
-            expanded.append(line)
-
-    vehicles = []
-    for line in expanded:
-        line = line.strip()
-        nm = re.match(r"^((?:Vehicles?|Van)\s+[A-Z0-9]+)", line, re.I)
-        if not nm:
-            nm = re.match(r"^([A-Z])(?:\s*:|\s+Start)", line, re.I)
-        if not nm: continue
-        name = re.sub(r"^Vehicles\b", "Vehicle", nm.group(1).strip(), flags=re.I)
-        rest = line[nm.end():].strip().lstrip(":").strip()
-        sm = re.search(r"Start(?:\s*[&]\s*End)?\s*:?\s*", rest, re.I)
-        if not sm: continue
-        after = rest[sm.end():]
-        ae = re.search(r"\s*[-]?\s*Capacity\b", after, re.I)
-        start_addr = (after[:ae.start()].strip() if ae else after.strip()).rstrip(" -,")
-        cm = re.search(r"Capacity\s*:?\s*(?:up\s+to\s+)?(\d+)\s*riders?", rest, re.I)
-        cap = int(cm.group(1)) if cm else 13
-        if name and start_addr:
-            vehicles.append({"name": name, "start": start_addr, "capacity": cap})
-    return vehicles
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Core routing
-# ─────────────────────────────────────────────────────────────────────────────
-
-def cluster_and_route(students: list, vehicles: list,
-                      progress_cb: Optional[Callable] = None,
-                      camp_address: str = None,
-                      trip_direction: str = "morning") -> list:
-    """
-    Full pipeline:
-    1. Geocode every address (OpenStreetMap — real lat/lon, ZIP ignored)
-    2. Group same-address students (families always together)
-    3. Cluster family units by TRUE address proximity ≤ NEIGHBOR_MI
-    4. Assign whole clusters to vehicles (nearest start, strict capacity)
-    5. Consolidate under-filled vehicles (full merge, then scatter)
-    6. Remove empty vehicles from output
-    7. Sequence stops:
-       - Morning: furthest from camp first (no backtracking toward camp)
-       - Afternoon: nearest to camp first (route away from camp)
-    8. Get driving times via OSRM (or road-factor fallback)
-
-    Args:
-        camp_address:    Override the default camp address
-        trip_direction:  "morning" (routes end at camp) or
-                         "afternoon" (routes start at camp, end at homes)
-    """
-    effective_camp = camp_address or CAMP_ADDRESS
-
-    # ── 1. Geocode ────────────────────────────────────────────────────────
-    all_addrs = list({s.full_address for s in students}
-                     | {v["start"] for v in vehicles}
-                     | {effective_camp})
-    coords = geocode_all_addresses(all_addrs, progress_cb)
-
-    camp_lat, camp_lon = coords.get(effective_camp, CAMP_COORDS)
-    for s in students:
-        s.lat, s.lon = coords.get(s.full_address, CAMP_COORDS)
-        s.geocoded   = (s.lat, s.lon) != CAMP_COORDS
-
-    if progress_cb:
-        ok = sum(1 for s in students if s.geocoded)
-        progress_cb(f"Geocoded {ok}/{len(students)} addresses")
-        # Flag any addresses that fell back to camp coords
-        bad = [s for s in students if not s.geocoded]
-        for s in bad[:5]:
-            progress_cb(f"  ⚠ Could not geocode: {s.full_address}")
-
-    # ── 2. Group by exact address (families) ──────────────────────────────
-    addr_map: dict = {}
-    for s in students:
-        addr_map.setdefault(s.address.lower().strip(), []).append(s)
-    family_units = list(addr_map.values())
-
-    def uc(u):   return u[0].lat, u[0].lon
-    def d2c(u):  return haversine_mi(*uc(u), camp_lat, camp_lon)
-
-    # ── 3. Geographic clustering — NO ZIP CODES ───────────────────────────
-    # Two houses ≤ NEIGHBOR_MI apart → same cluster regardless of ZIP.
-    clusters: list = []
-    for unit in family_units:
-        ulat, ulon = uc(unit)
-        best_ci, best_d = None, float("inf")
-        for ci, cluster in enumerate(clusters):
-            for eu in cluster:
-                d = haversine_mi(ulat, ulon, *uc(eu))
-                if d <= NEIGHBOR_MI and d < best_d:
-                    best_d, best_ci = d, ci
-        if best_ci is not None:
-            clusters[best_ci].append(unit)
-        else:
-            clusters.append([unit])
-
-    if progress_cb:
-        progress_cb(f"Formed {len(clusters)} geographic clusters "
-                    f"(≤{NEIGHBOR_MI} mi between actual house coordinates)")
-
-    # ── 4. Build vehicle objects ──────────────────────────────────────────
-    def cl_size(cl): return sum(len(u) for u in cl)
-
-    veh_objects = []
-    for v in vehicles:
-        lat, lon = coords.get(v["start"], CAMP_COORDS)
-        veh_objects.append(Vehicle(
-            name=v["name"], start_address=v["start"],
-            capacity=v["capacity"], start_lat=lat, start_lon=lon))
-
-    # ── 5. Assign WHOLE CLUSTERS to vehicles ──────────────────────────────
-    # Clusters are the atomic unit — neighbours are never split.
-    # Clusters too large for any single vehicle are split by distance-to-camp.
-    max_cap = max(v["capacity"] for v in vehicles)
-    assignable: list = []
-    for cl in clusters:
-        if cl_size(cl) <= max_cap:
-            assignable.append(cl)
-        else:
-            units_sorted = sorted(cl, key=d2c, reverse=True)
-            chunk, chunk_n = [], 0
-            for u in units_sorted:
-                if chunk_n + len(u) > max_cap and chunk:
-                    assignable.append(chunk); chunk, chunk_n = [], 0
-                chunk.append(u); chunk_n += len(u)
-            if chunk: assignable.append(chunk)
-
-    # Sort: farthest-from-camp clusters first (priority placement)
-    assignable.sort(
-        key=lambda cl: haversine_mi(*centroid(cl), camp_lat, camp_lon),
-        reverse=True)
-
-    assignments = [[] for _ in veh_objects]
-    counts      = [0]  * len(veh_objects)
-
-    # ── Geographic-first cluster assignment ─────────────────────────────────
-    # Strategy: assign each cluster to its nearest vehicle by start distance.
-    # Vehicles with identical starts (e.g. D/E/F all at Quakertown) share load.
-    # A vehicle that is already full forces overflow to the next-nearest vehicle.
-    # This prevents a centrally-located vehicle from becoming a gravity well.
-
-    def nearest_vehicles(clat, clon):
-        """Return vehicle indices sorted by distance from cluster centroid to start."""
-        return sorted(range(len(veh_objects)),
-                      key=lambda vi: haversine_mi(clat, clon,
-                                                  veh_objects[vi].start_lat,
-                                                  veh_objects[vi].start_lon))
-
-    def assign_unit_group(units, size):
-        """Assign a list of units to the nearest vehicle with room."""
-        clat = sum(uc(u)[0] for u in units) / len(units)
-        clon = sum(uc(u)[1] for u in units) / len(units)
-        for vi in nearest_vehicles(clat, clon):
-            if veh_objects[vi].capacity - counts[vi] >= size:
-                for u in units:
-                    assignments[vi].append(u)
-                counts[vi] += size
-                return vi
-        # No vehicle has room — put on least-full vehicle
-        vi = min(range(len(veh_objects)), key=lambda i: counts[i])
-        for u in units:
-            assignments[vi].append(u)
-        counts[vi] += size
-        return vi
-
-    for cl in assignable:
-        sz = cl_size(cl)
-        clat, clon = centroid(cl)
-        assigned = False
-        for vi in nearest_vehicles(clat, clon):
-            if veh_objects[vi].capacity - counts[vi] >= sz:
-                for u in cl:
-                    assignments[vi].append(u)
-                counts[vi] += sz
-                assigned = True
-                break
-        if not assigned:
-            # Split cluster into individual units and assign each
-            for u in cl:
-                assign_unit_group([u], len(u))
-
-    leftover = []  # leftover is handled above — kept for compatibility
-
-    for unit in sorted(leftover, key=d2c, reverse=True):
-        sz = len(unit)
-        ulat, ulon = uc(unit)
-        scores = [(haversine_mi(ulat, ulon, veh_objects[vi].start_lat,
-                                veh_objects[vi].start_lon), vi)
-                  for vi in range(len(veh_objects))
-                  if veh_objects[vi].capacity - counts[vi] >= sz]
-        vi = min(scores)[1] if scores else min(range(len(veh_objects)),
-                                               key=lambda i: counts[i])
-        assignments[vi].append(unit)
-        counts[vi] += sz
-
-    # ── 5b. Consolidation — eliminate under-filled vehicles ───────────────
-    # Two passes per iteration:
-    #   FULL MERGE: if one vehicle can absorb all of the donor's students, do it
-    #   SCATTER:    otherwise send each family unit to nearest vehicle with room
-    # An isolated geographic cluster may not reach MIN_UTIL — that's accepted
-    # and flagged with a warning in the spreadsheet rather than breaking routing.
-    changed, passes = True, 0
-    while changed and passes < 30:
-        changed, passes = False, passes + 1
-
-        # Sort under-filled: emptiest first (empty buses eliminated first)
-        # Small vehicles (capacity ≤ 6) use a lower threshold since they're
-        # harder to fill precisely with geographic constraints
-        def effective_threshold(vi):
-            cap = veh_objects[vi].capacity
-            if cap <= 6:  return 0.40   # 40% min for small vans
-            if cap <= 9:  return 0.50   # 50% min for medium vans
-            return MIN_UTIL              # 75% for full-size vans
-
-        under = sorted(
-            [vi for vi in range(len(veh_objects))
-             if counts[vi] > 0 and
-                counts[vi] / veh_objects[vi].capacity < effective_threshold(vi)],
-            key=lambda vi: counts[vi])
-
-        if not under: break
-        vi_src = under[0]
-        units_src = assignments[vi_src][:]
-        total_src = counts[vi_src]
-
-        if not units_src:
-            # Already empty — will be pruned in step 5c
-            changed = True; continue
-
-        src_lat, src_lon = centroid(units_src)
-
-        # ── Full merge ────────────────────────────────────────────────────
-        full_dest, full_dist = None, float("inf")
-        for vi_dst in range(len(veh_objects)):
-            if vi_dst == vi_src: continue
-            if veh_objects[vi_dst].capacity - counts[vi_dst] < total_src: continue
-            if assignments[vi_dst]:
-                dlat, dlon = centroid(assignments[vi_dst])
-            else:
-                dlat, dlon = veh_objects[vi_dst].start_lat, veh_objects[vi_dst].start_lon
-            d = haversine_mi(src_lat, src_lon, dlat, dlon)
-            if d < full_dist: full_dist, full_dest = d, vi_dst
-
-        # Only allow full merge if destination is geographically close
-        MAX_MERGE_MI = 5.0
-        if full_dest is not None and full_dist <= MAX_MERGE_MI:
-            for u in units_src: assignments[full_dest].append(u)
-            counts[full_dest] += total_src
-            assignments[vi_src] = []; counts[vi_src] = 0
-            if progress_cb:
-                progress_cb(f"  Merged {veh_objects[vi_src].name} ({total_src}) → "
-                            f"{veh_objects[full_dest].name} "
-                            f"({counts[full_dest]}/{veh_objects[full_dest].capacity})")
-            changed = True; continue
-
-        # ── Scatter: move sub-groups to nearest vehicle with room ──────────
-        # IMPORTANT: we scatter by geographic sub-groups, not individual units.
-        # Units within NEIGHBOR_MI of each other are moved together to preserve
-        # the neighbor-grouping guarantee. This prevents consolidation from
-        # splitting clusters that were correctly grouped in step 3.
-        
-        # Build sub-groups: connected components within NEIGHBOR_MI
-        remaining = list(units_src)
-        sub_groups = []
-        while remaining:
-            group = [remaining[0]]
-            remaining.pop(0)
-            changed_inner = True
-            while changed_inner:
-                changed_inner = False
-                for unit in list(remaining):
-                    ulat, ulon = uc(unit)
-                    if any(haversine_mi(ulat, ulon, *uc(g)) <= NEIGHBOR_MI
-                           for g in group):
-                        group.append(unit)
-                        remaining.remove(unit)
-                        changed_inner = True
-            sub_groups.append(group)
-        
-        # Sort sub-groups largest first (harder to place)
-        sub_groups.sort(key=lambda g: sum(len(u) for u in g), reverse=True)
-        
-        moved = False
-        for group in sub_groups:
-            group_size = sum(len(u) for u in group)
-            glat = sum(uc(u)[0] for u in group) / len(group)
-            glon = sum(uc(u)[1] for u in group) / len(group)
-            
-            # Max distance a group can be scattered — prevents mixing
-            # students from completely different geographic areas
-            MAX_SCATTER_MI = 2.5
-
-            best_vi, best_d = None, float("inf")
-            for vi_dst in range(len(veh_objects)):
-                if vi_dst == vi_src: continue
-                if veh_objects[vi_dst].capacity - counts[vi_dst] < group_size: continue
-                if assignments[vi_dst]:
-                    d = min(haversine_mi(glat, glon, *uc(eu))
-                            for eu in assignments[vi_dst])
-                    # Hard reject: too far from any existing stop on this vehicle
-                    if d > MAX_SCATTER_MI: continue
-                else:
-                    d = haversine_mi(glat, glon,
-                                     veh_objects[vi_dst].start_lat,
-                                     veh_objects[vi_dst].start_lon)
-                    # Empty vehicle — only accept if start is reasonably close
-                    if d > MAX_SCATTER_MI * 2: continue
-                if d < best_d: best_d, best_vi = d, vi_dst
-
-            if best_vi is not None:
-                for unit in group:
-                    assignments[best_vi].append(unit)
-                    assignments[vi_src].remove(unit)
-                counts[best_vi] += group_size
-                counts[vi_src]  -= group_size
-                moved = True
-                names = ", ".join(u[0].last for u in group)
-                if progress_cb:
-                    progress_cb(f"  Moved sub-group [{names}] ({group_size}) "
-                                f"{veh_objects[vi_src].name} → "
-                                f"{veh_objects[best_vi].name}")
-        if moved: changed = True
-        # If nothing moved: geographic constraint — accept and flag as warning
-
-    # ── 5c. Prune truly empty vehicles (0 riders) ────────────────────────
-    # Vehicles that have riders but are under threshold are kept and flagged.
-    # Only vehicles with zero riders are removed from the output.
-    active = [vi for vi in range(len(veh_objects)) if counts[vi] > 0]
-    veh_objects = [veh_objects[vi] for vi in active]
-    assignments = [assignments[vi] for vi in active]
-    counts      = [counts[vi]      for vi in active]
-    if progress_cb:
-        progress_cb(f"Active vehicles: {len(veh_objects)}")
-
-    # ── 6. Sequence stops + driving times ────────────────────────────────
-    for vi, veh in enumerate(veh_objects):
-        if not assignments[vi]:
-            veh.total_time = "—"; veh.total_distance = "—"; continue
-
-        # Build address-level stop objects
-        addr_stop: dict = {}
-        for unit in assignments[vi]:
-            rep = unit[0]; key = rep.full_address.lower().strip()
-            if key not in addr_stop:
-                addr_stop[key] = Stop(address=rep.full_address,
-                                      lat=rep.lat, lon=rep.lon)
-            addr_stop[key].riders.extend(unit)
-
-        # Log any stops with zero coordinates
-        if progress_cb:
-            zero_stops = [s for s in addr_stop.values() if abs(s.lat) < 0.001]
-            if zero_stops:
-                for zs in zero_stops:
-                    progress_cb(f"  ⚠ Stop has no coordinates: {zs.address}")
-
-        # ── Nearest-neighbor TSP with farthest-point terminus constraint ────
-        #
-        # FARTHEST-POINT TERMINUS RULE:
-        #   The geometrically farthest stop from camp is the route terminus —
-        #   no stops may appear after it in the sequence. This enforces an
-        #   outbound-only spine: the bus travels away from camp to the farthest
-        #   point, picks up everyone along the way, then returns directly.
-        #   Eliminates "loop-back" extensions that inflate distance 10-20%.
-        #
-        #   Exception: stops within 5% of the total route radius of the farthest
-        #   stop are considered co-terminus and may follow it (road constraints).
-        #
-        # Morning:   farthest stop first → work toward camp
-        # Afternoon: nearest stop first → work away from camp (mirror logic)
-        unvisited = list(addr_stop.values())
-
-        def dist_to_camp_s(s):
-            return haversine_mi(s.lat, s.lon, camp_lat, camp_lon)
-
-        # ── Farthest-Point Terminus Constraint ───────────────────────────────
-        # Outbound-terminating route: the geometrically farthest stop from
-        # camp (morning) or nearest stop to camp (afternoon) is the terminus.
-        # After it, no stop may be farther out — this eliminates loop-backs.
-        #
-        # Implementation uses a DYNAMIC terminus that updates as stops are
-        # placed, with an ×8 hard penalty for terminus violations. A 10%
-        # slack band allows minor road-geometry deviations without penalty.
-
-        # Start at farthest (morning) or nearest (afternoon)
-        if trip_direction == "afternoon":
-            first = min(unvisited, key=dist_to_camp_s)
-        else:
-            first = max(unvisited, key=dist_to_camp_s)
-
-        sorted_stops  = [first]
-        unvisited.remove(first)
-
-        # Dynamic terminus: tracks the extreme dist-from-camp placed so far
-        # Morning:   terminus_d = max dist seen (no stop may exceed this)
-        # Afternoon: terminus_d = min dist seen (no stop may go below this)
-        terminus_d = dist_to_camp_s(first)
-
-        while unvisited:
-            last      = sorted_stops[-1]
-            cur_d2c   = dist_to_camp_s(last)
-            best_stop, best_score = None, float("inf")
-
-            for s in unvisited:
-                geo_d  = haversine_mi(last.lat, last.lon, s.lat, s.lon)
-                d2c_s  = dist_to_camp_s(s)
-
-                if trip_direction == "afternoon":
-                    directional_penalty = max(0.0, terminus_d - d2c_s) * 0.5
-                    # Terminus violation: stop closer to camp than current min
-                    violation = max(0.0, terminus_d - d2c_s)
-                else:
-                    directional_penalty = max(0.0, d2c_s - cur_d2c) * 0.5
-                    # Terminus violation: stop farther from camp than current max
-                    violation = max(0.0, d2c_s - terminus_d)
-
-                # Allow 10% slack for road-geometry constraints
-                slack = terminus_d * 0.10
-                terminus_penalty = (violation * 8.0) if violation > slack else 0.0
-
-                score = geo_d + directional_penalty + terminus_penalty
-                if score < best_score:
-                    best_score, best_stop = score, s
-
-            if best_stop is None:
-                # Safety: all candidates blocked — pick nearest anyway
-                # (every student must be assigned, even if it creates a minor loop)
-                best_stop = min(unvisited,
-                                key=lambda s: haversine_mi(last.lat, last.lon, s.lat, s.lon))
-
-            sorted_stops.append(best_stop)
-            unvisited.remove(best_stop)
-
-            # Update dynamic terminus
-            d2c_placed = dist_to_camp_s(best_stop)
-            if trip_direction == "afternoon":
-                terminus_d = min(terminus_d, d2c_placed)
-            else:
-                terminus_d = max(terminus_d, d2c_placed)
-
-        # Real driving times: vehicle start → stop1 → … → stopN → camp
-        coord_seq = ([(veh.start_lat, veh.start_lon)]
-                     + [(s.lat, s.lon) for s in sorted_stops]
-                     + [(camp_lat, camp_lon)])
-        legs = route_leg_times(coord_seq, progress_cb)
-
-        # legs[0]=garage→stop1, legs[1]=stop1→stop2, legs[N]=stopN→camp
-        for i, stop in enumerate(sorted_stops):
-            if i == 0:
-                mins = max(1, round(legs[0]))
-                stop.drive_time = f"{mins} min from garage"
-            else:
-                mins = max(1, round(legs[i]))
-                stop.drive_time = f"{mins} min"
-
-        veh.stops    = sorted_stops
-        veh.camp_lat = camp_lat
-        veh.camp_lon = camp_lon
-
-        # Total ride time for KIDS = first pickup → camp (excludes garage deadhead)
-        # legs[1] through legs[N] are stop-to-stop, legs[-1] is lastStop→camp
-        kids_mins = round(sum(legs[1:]))  # excludes garage→first stop
-        if kids_mins >= 60:
-            hrs, rem = divmod(kids_mins, 60)
-            veh.total_time = f"{hrs} hr {rem} min" if rem else f"{hrs} hr"
-        else:
-            veh.total_time = f"{kids_mins} min"
-
-        # Total distance includes full route from garage
-        total_mins = round(sum(legs))
-
-        dist = sum(
-            haversine_mi(coord_seq[i][0], coord_seq[i][1],
-                         coord_seq[i+1][0], coord_seq[i+1][1]) * ROAD_FACTOR
-            for i in range(len(coord_seq)-1))
-        veh.total_distance = f"{round(dist, 1)} mi"
-
-        # Flag under-threshold for dashboard warning
-        cap = veh.capacity
-        eff_threshold = 0.50 if cap <= 6 else (0.60 if cap <= 9 else MIN_UTIL)
-        veh.under_threshold = (veh.rider_count / cap < eff_threshold
-                                if cap else False)
-
-    return veh_objects
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Excel output
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _fill(c):   return PatternFill("solid", start_color=c, fgColor=c)
-def _font(bold=False, size=11, color=DARK_TEXT, italic=False):
-    return Font(name="Arial", bold=bold, size=size, color=color, italic=italic)
-def _align(h="left", v="center", wrap=False):
-    return Alignment(horizontal=h, vertical=v, wrap_text=wrap)
-def _bdr(**kw): return Border(**kw)
-
-
-def build_dashboard(wb: Workbook, vehicles: list, camp_address: str = None, trip_direction: str = "morning"):
-    ws = wb.active
-    ws.title = "Route Summary"
-    for col, w in zip("ABCDEFGH", [18, 54, 10, 10, 9, 16, 13, 10]):
-        ws.column_dimensions[col].width = w
-
-    # Title
-    ws.merge_cells("A1:H1")
-    c = ws["A1"]
-    c.value     = "🚌  Elbow Lane Day Camp — Vehicle Route Plan"
-    c.font      = _font(bold=True, size=16, color=WHITE)
-    c.fill      = _fill(BRAND_COLOR)
-    c.alignment = _align("center")
-    ws.row_dimensions[1].height = 32
-
-    # Subtitle
-    ws.merge_cells("A2:H2")
-    c = ws["A2"]
-    camp_display = camp_address or CAMP_ADDRESS
-    direction_label = "All vehicles depart from" if trip_direction == "afternoon" else "All vehicles finish at"
-    c.value = (f"{direction_label}: {camp_display}  |  "
-               "Clustered by real street-address proximity (OpenStreetMap)  |  "
-               "Drive times via OSRM road-network routing")
-    c.font      = _font(size=9, italic=True, color="444444")
-    c.fill      = _fill(BRAND_LIGHT)
-    c.alignment = _align("center")
-    ws.row_dimensions[2].height = 18
-
-    # Headers
-    hdrs = ["Vehicle", "Starting Point / Route Corridor",
-            "Capacity", "Riders", "Stops", "Drive Time", "Distance", "Utilization"]
-    for ci, h in enumerate(hdrs, 1):
-        cell = ws.cell(row=3, column=ci, value=h)
-        cell.font      = _font(bold=True, size=10, color=WHITE)
-        cell.fill      = _fill(BRAND_COLOR)
-        cell.alignment = _align("center")
-        cell.border    = _bdr(bottom=MED_SIDE, top=MED_SIDE,
-                               left=THIN_SIDE, right=THIN_SIDE)
-    ws.row_dimensions[3].height = 18
-
-    total_cap = total_riders = 0
-    has_warnings = False
-    for ri, veh in enumerate(vehicles):
-        row   = 4 + ri
-        warn  = veh.under_threshold
-        if warn: has_warnings = True
-        bg    = _fill(ORANGE_FILL) if warn else (_fill(WHITE) if ri%2==0 else _fill(LIGHT_GRAY))
-        util_txt = f"{veh.utilization_pct}%"
-        if warn: util_txt += " ⚠"
-
-        vals = [veh.name,
-                f"{veh.start_address}  |  {veh.corridor}",
-                veh.capacity, veh.rider_count, veh.stop_count,
-                veh.total_time, veh.total_distance, util_txt]
-        for ci, val in enumerate(vals, 1):
-            cell = ws.cell(row=row, column=ci, value=val)
-            cell.font      = _font(size=10, bold=warn)
-            cell.fill      = bg
-            cell.alignment = _align("left" if ci == 2 else "center")
-            cell.border    = _bdr(bottom=THIN_SIDE)
-        total_cap    += veh.capacity
-        total_riders += veh.rider_count
-        ws.row_dimensions[row].height = 15
-
-    # Totals row
-    tr = 4 + len(vehicles)
-    ws.merge_cells(f"A{tr}:B{tr}")
-    c = ws[f"A{tr}"]
-    c.value     = (f"TOTAL  ({total_riders} riders / {total_cap} capacity "
-                   f"/ {len(vehicles)} vehicles)")
-    c.font      = _font(bold=True, size=10, color=WHITE)
-    c.fill      = _fill(BRAND_COLOR)
-    c.alignment = _align("center")
-    for ci, val in [(3, total_cap), (4, f"=SUM(D4:D{tr-1})"),
-                    (5, f"=SUM(E4:E{tr-1})"),
-                    (6, "—"), (7, "—"), (8, "—")]:
-        cell = ws.cell(row=tr, column=ci, value=val)
-        cell.font = _font(bold=True, color=WHITE); cell.fill = _fill(BRAND_COLOR)
-        cell.alignment = _align("center")
-    ws.row_dimensions[tr].height = 18
-
-    # Legend / warning
-    lr = tr + 2
-    ws.merge_cells(f"A{lr}:H{lr}")
-    c = ws[f"A{lr}"]
-    if has_warnings:
-        c.value = ("⚠  Orange rows are below 60% capacity.  "
-                   "These vehicles serve geographically isolated stops that cannot be "
-                   "merged without splitting neighbour groups.  "
-                   "Consider reducing the number of vehicles in the fleet config.")
-        c.font  = _font(size=9, bold=True, color="7B3F00", italic=False)
-        c.fill  = _fill(ORANGE_FILL)
-    else:
-        c.value = ("All vehicles at ≥ 75% capacity  |  "
-                   "Drive times via OSRM road-network routing  |  "
-                   "Clustering by real geocoded addresses (OpenStreetMap) — ZIP codes ignored")
-        c.font  = _font(size=9, italic=True, color="555555")
-    c.alignment = _align("left", wrap=True)
-    ws.row_dimensions[lr].height = 28
-
-
-def build_vehicle_sheet(wb: Workbook, veh: Vehicle, camp_address: str = None, trip_direction: str = "morning"):
-    ws = wb.create_sheet(title=veh.name)
-    for col, w in zip("ABCDE", [9, 40, 28, 12, 22]):
-        ws.column_dimensions[col].width = w
-
-    # Title
-    ws.merge_cells("A1:E1")
-    c = ws["A1"]
-    c.value     = f"🚌  {veh.name}  —  Route Sheet"
-    c.font      = _font(bold=True, size=14, color=WHITE)
-    c.fill      = _fill(BRAND_COLOR)
-    c.alignment = _align("center")
-    ws.row_dimensions[1].height = 28
-
-    # Summary bar — orange if under-threshold
-    ws.merge_cells("A2:E2")
-    c = ws["A2"]
-    warn_tag = "  ⚠ Below 75% — see dashboard" if veh.under_threshold else ""
-    c.value = (f"Start: {veh.start_address}   |   Cap: {veh.capacity}   |   "
-               f"Riders: {veh.rider_count} ({veh.utilization_pct}%)   |   "
-               f"Total Route: {veh.total_time}, {veh.total_distance}{warn_tag}")
-    c.font      = _font(size=9, italic=True,
-                        color="7B3F00" if veh.under_threshold else DARK_TEXT)
-    c.fill      = _fill(ORANGE_FILL if veh.under_threshold else BRAND_LIGHT)
-    c.alignment = _align("left")
-    ws.row_dimensions[2].height = 16
-
-    # Column headers
-    for ci, h in enumerate(["Stop #","Address","Riders","# Riders","Drive Time"], 1):
-        cell = ws.cell(row=3, column=ci, value=h)
-        cell.font      = _font(bold=True, size=10, color=WHITE)
-        cell.fill      = _fill(BRAND_COLOR)
-        cell.alignment = _align("center")
-        cell.border    = _bdr(bottom=MED_SIDE)
-    ws.row_dimensions[3].height = 16
-
-    # START row
-    for ci, val in enumerate([" START", veh.start_address,
-                               "Departure point", None, None], 1):
-        cell = ws.cell(row=4, column=ci, value=val)
-        cell.font  = _font(bold=(ci==1), italic=(ci==3), color="555555")
-        cell.fill  = _fill(LIGHT_GRAY)
-        cell.alignment = _align("left" if ci == 2 else "center")
-    ws.row_dimensions[4].height = 14
-
-    # Stop rows
-    for si, stop in enumerate(veh.stops):
-        row = 5 + si
-        bg  = _fill(WHITE) if si % 2 == 0 else _fill(LIGHT_GRAY)
-        for ci, val in enumerate([si+1, stop.address, stop.rider_names,
-                                   stop.rider_count, stop.drive_time], 1):
-            cell = ws.cell(row=row, column=ci, value=val)
-            cell.font      = _font(bold=(ci==1), size=10)
-            cell.fill      = bg
-            cell.alignment = _align("center" if ci in (1,4) else "left")
-            cell.border    = _bdr(bottom=THIN_SIDE)
-        ws.row_dimensions[row].height = 14
-
-    # ARRIVE row
-    arrive = 5 + len(veh.stops)
-    if veh.stops:
-        last = veh.stops[-1]
-        final = max(1, round(_fallback_minutes(last.lat, last.lon, *CAMP_COORDS)))
-        arrive_time = f"{final} min → ARRIVE"
-    else:
-        arrive_time = "— → ARRIVE"
-
-    arrive_label = camp_address or CAMP_ADDRESS
-    dest_display = arrive_label.split(",")[0] if "," in arrive_label else arrive_label
-    action_word = "DEPART" if trip_direction == "afternoon" else "ARRIVE"
-    for ci, val in enumerate([action_word, arrive_label,
-                               "—", "—", arrive_time], 1):
-        cell = ws.cell(row=arrive, column=ci, value=val)
-        cell.font      = _font(bold=True, color="006400")
-        cell.fill      = _fill(GREEN_FILL)
-        cell.alignment = _align("left" if ci == 2 else "center")
-        cell.border    = _bdr(top=MED_SIDE, bottom=MED_SIDE)
-    ws.row_dimensions[arrive].height = 16
-
-    # Total riders
-    tr = arrive + 1
-    ws.cell(row=tr, column=4, value="Total Riders:").font = _font(bold=True)
-    ws.cell(row=tr, column=4).alignment = _align("right")
-    cell = ws.cell(row=tr, column=5, value=f"=SUM(D5:D{arrive-1})")
-    cell.font = _font(bold=True); cell.alignment = _align("center")
-
-    # Footer note
-    nr = tr + 1
-    ws.merge_cells(f"A{nr}:E{nr}")
-    note = ws[f"A{nr}"]
-    note.value = ("Drive times via OSRM road-network routing  |  "
-                  "Stop order by real geocoded coordinates (OpenStreetMap) — ZIP codes not used  |  "
-                  "Falls back to road-distance estimate if OSRM unavailable")
-    note.font  = _font(size=8, italic=True, color="777777")
-    note.alignment = _align("left")
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Public API
-# ─────────────────────────────────────────────────────────────────────────────
-
-def generate_routes(
-    csv_text: str,
-    vehicles_text: str,
-    output_path: str = "bus_routes_output.xlsx",
-    route_data: Optional[list] = None,
-    progress_cb: Optional[Callable] = None,
-    camp_address: str = None,
-    trip_direction: str = "morning",
-) -> str:
-    """
-    Parse → geocode → cluster → assign → consolidate → Excel.
-
-    Args:
-        camp_address:    Camp destination/origin (defaults to 828 Elbow Lane)
-        trip_direction:  "morning" (students travel TO camp) or
-                         "afternoon" (students travel FROM camp HOME)
-    Returns output_path on success.
-    """
-    students = parse_students_csv(csv_text)
-    if not students:
-        raise ValueError("No students parsed. Check CSV format.")
-
-    vehicle_configs = parse_vehicles_text(vehicles_text)
-    if not vehicle_configs:
-        raise ValueError("No vehicles parsed. Check fleet configuration format.")
-
-    if progress_cb:
-        unique = len({s.full_address for s in students})
-        progress_cb(f"Loaded {len(students)} students across {unique} addresses, "
-                    f"{len(vehicle_configs)} vehicles")
-
-    if route_data:
-        vehicles = _apply_ai_routes(vehicle_configs, route_data)
-    else:
-        vehicles = cluster_and_route(students, vehicle_configs, progress_cb,
-                                          camp_address=camp_address,
-                                          trip_direction=trip_direction)
-
-    wb = Workbook()
-    build_dashboard(wb, vehicles, camp_address=camp_address, trip_direction=trip_direction)
-    for veh in vehicles:
-        build_vehicle_sheet(wb, veh, camp_address=camp_address, trip_direction=trip_direction)
-
-    wb.save(output_path)
-    if progress_cb:
-        progress_cb(f"✅  Saved: {output_path}")
-    return output_path
-
-
-def _apply_ai_routes(vehicle_configs, route_data) -> list:
-    """Use pre-computed AI route data instead of algorithmic clustering."""
-    vehicles = []
-    for rd in route_data:
-        veh = Vehicle(name=rd.get("vehicle_name","?"),
-                      start_address=rd.get("start_address",""),
-                      capacity=rd.get("capacity", 13),
-                      total_time=rd.get("total_time","—"),
-                      total_distance=rd.get("total_distance","—"))
-        for sd in rd.get("stops", []):
-            stop = Stop(address=sd.get("address",""))
-            for name in sd.get("rider_names", []):
-                stop.riders.append(Student(0, name, "", "", "", ""))
-            stop.drive_time = sd.get("drive_time","")
-            veh.stops.append(stop)
-        vehicles.append(veh)
-    return vehicles
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# CLI
-# ─────────────────────────────────────────────────────────────────────────────
-
-def main():
-    parser = argparse.ArgumentParser(description="Elbow Lane Camp Bus Router")
-    parser.add_argument("--csv",        required=True)
-    parser.add_argument("--vehicles",   required=True)
-    parser.add_argument("--output",     default="bus_routes_output.xlsx")
-    parser.add_argument("--route-json", default=None)
-    args = parser.parse_args()
-
-    with open(args.csv, encoding="utf-8-sig") as f:
-        csv_text = f.read()
-    try:
-        with open(args.vehicles) as f:
-            vehicles_text = f.read()
-    except (FileNotFoundError, IsADirectoryError):
-        vehicles_text = args.vehicles.replace("\\n", "\n")
-
-    route_data = None
-    if args.route_json:
-        with open(args.route_json) as f:
-            route_data = json.load(f)
-
-    generate_routes(csv_text, vehicles_text, args.output, route_data, print)
-
+builder.addEventListener('change', e => {
+  const idx = +e.target.dataset.idx;
+  const field = e.target.dataset.field;
+  fleet[idx][field] = field === 'capacity' ? parseInt(e.target.value) : e.target.value;
+  updateFleetSummary();
+  updateRunBtn();
+});
+
+builder.addEventListener('input', e => {
+  const idx = +e.target.dataset.idx;
+  const field = e.target.dataset.field;
+  if (field === 'address') { fleet[idx].address = e.target.value; updateRunBtn(); }
+});
+
+builder.addEventListener('click', e => {
+  if (e.target.classList.contains('rm-row')) {
+    const idx = +e.target.dataset.idx;
+    if (fleet.length > 1) { fleet.splice(idx, 1); renderFleet(); }
+  }
+});
+
+document.getElementById('add-vehicle-btn').addEventListener('click', () => {
+  const used = new Set(fleet.map(v => v.name));
+  const next = VEHICLE_NAMES.find(n => !used.has(n)) || `Vehicle ${fleet.length + 1}`;
+  fleet.push({name: next, address: '', capacity: 13});
+  renderFleet();
+});
+
+function updateFleetSummary() {
+  const summary = document.getElementById('fleet-summary');
+  const total = fleet.reduce((s, v) => s + v.capacity, 0);
+  const filled = fleet.filter(v => v.address.trim()).length;
+  const seatsOk = studentCount === 0 || total >= studentCount;
+  summary.innerHTML = `
+    <span class="fleet-chip">🚌 ${fleet.length} vehicles</span>
+    <span class="fleet-chip" style="${!seatsOk ? 'background:#fde8e8;border-color:#e07070;color:#7a1f1f' : ''}">
+      💺 ${total} total seats${studentCount > 0 ? ' / ' + studentCount + ' needed' : ''}
+    </span>
+    <span class="fleet-chip" style="${filled < fleet.length ? 'background:#fff3cd;border-color:#f0c060' : ''}">
+      📍 ${filled}/${fleet.length} addresses entered
+    </span>
+  `;
+  checkCapacity();
+}
+
+function checkCapacity() {
+  const total = fleet.reduce((s, v) => s + v.capacity, 0);
+  const warning = document.getElementById('capacity-warning');
+  const msg = document.getElementById('capacity-warning-msg');
+  if (studentCount > 0 && total < studentCount) {
+    const needed = studentCount - total;
+    msg.textContent = `Not enough seats — you have ${total} seats for ${studentCount} students. Add ${needed} more seat${needed !== 1 ? 's' : ''} by increasing vehicle capacities or adding another vehicle.`;
+    warning.style.display = 'flex';
+  } else {
+    warning.style.display = 'none';
+  }
+  updateRunBtn();
+}
+
+function fleetToText() {
+  return fleet.map(v =>
+    `${v.name}: Start: ${v.address || '828 Elbow Lane, Warrington, PA'} - Capacity: ${v.capacity} riders`
+  ).join('\n');
+}
+
+// CSV upload
+const dropZone = document.getElementById('drop-zone');
+const csvInput = document.getElementById('csv-file');
+const fileChosen = document.getElementById('file-chosen');
+let studentCount = 0;
+let tripDirection = "morning";
+
+function setTrip(dir) {
+  tripDirection = dir;
+  document.getElementById('btn-morning').classList.toggle('active', dir === 'morning');
+  document.getElementById('btn-afternoon').classList.toggle('active', dir === 'afternoon');
+  const hint = document.getElementById('trip-hint');
+  const title = document.getElementById('roster-title');
+  if (dir === 'afternoon') {
+    hint.innerHTML = 'Students travel <strong>home from camp</strong>';
+    title.textContent = 'Afternoon Roster';
+  } else {
+    hint.innerHTML = 'Students travel <strong>to camp</strong>';
+    title.textContent = 'Morning Roster';
+  }
+}
+
+function setFile(file) {
+  csvFile = file;
+  document.getElementById('file-name').textContent = file.name;
+  const reader = new FileReader();
+  reader.onload = e => {
+    const lines = e.target.result.split('\n').filter(l => l.trim()).length;
+    studentCount = lines - 1;
+    document.getElementById('file-rows').textContent = `· ${studentCount} students`;
+    checkCapacity();
+  };
+  reader.readAsText(file);
+  fileChosen.classList.add('visible');
+  dropZone.querySelector('.drop-icon').textContent = '✅';
+  updateRunBtn();
+}
+
+csvInput.addEventListener('change', e => { if (e.target.files[0]) setFile(e.target.files[0]); });
+dropZone.addEventListener('dragover', e => { e.preventDefault(); dropZone.classList.add('drag-over'); });
+dropZone.addEventListener('dragleave', () => dropZone.classList.remove('drag-over'));
+dropZone.addEventListener('drop', e => {
+  e.preventDefault(); dropZone.classList.remove('drag-over');
+  const f = e.dataTransfer.files[0];
+  if (f && f.name.endsWith('.csv')) setFile(f);
+});
+
+document.getElementById('remove-file').addEventListener('click', e => {
+  e.stopPropagation(); csvFile = null; csvInput.value = '';
+  studentCount = 0;
+  fileChosen.classList.remove('visible');
+  dropZone.querySelector('.drop-icon').textContent = '📋';
+  document.getElementById('capacity-warning').style.display = 'none';
+  updateRunBtn();
+});
+
+function updateRunBtn() {
+  const hasCSV = !!csvFile;
+  const hasAddresses = fleet.some(v => v.address.trim().length > 5);
+  const totalSeats = fleet.reduce((s, v) => s + v.capacity, 0);
+  const hasEnoughSeats = studentCount === 0 || totalSeats >= studentCount;
+  const btn = document.getElementById('run-btn');
+  const label = document.getElementById('run-label');
+  btn.disabled = !(hasCSV && hasAddresses && hasEnoughSeats);
+  if (hasCSV && hasAddresses && !hasEnoughSeats) {
+    label.textContent = `Not enough seats (${totalSeats} / ${studentCount} needed)`;
+  } else {
+    label.textContent = 'Generate Route Plan';
+  }
+}
+
+// Run
+document.getElementById('run-btn').addEventListener('click', async () => {
+  document.getElementById('action-bar').style.display = 'none';
+  document.getElementById('error-card').classList.remove('visible');
+  document.getElementById('log').innerHTML = '';
+  setPbar(0); lastLineCount = 0;
+  setRunning(true);
+  document.getElementById('prog-panel').classList.add('visible');
+
+  const fd = new FormData();
+  fd.append('csv_file', csvFile);
+  fd.append('vehicles_text', fleetToText());
+  fd.append('camp_address', document.getElementById('camp-address').value.trim());
+  fd.append('trip_direction', tripDirection);
+
+  try {
+    const res = await fetch('/api/run', {method:'POST', body:fd});
+    const data = await res.json();
+    if (!res.ok || data.error) { showError(data.error || 'Server error'); return; }
+    currentJobId = data.job_id;
+    appendLog(`Job started — ID: ${currentJobId}`);
+    pollStatus();
+  } catch(err) {
+    showError('Could not connect: ' + err.message);
+  }
+});
+
+// Polling
+function pollStatus() {
+  pollTimer = setInterval(async () => {
+    try {
+      const res = await fetch(`/api/status/${currentJobId}`);
+      const data = await res.json();
+      const lines = data.progress || [];
+      for (let i = lastLineCount; i < lines.length; i++) appendLog(lines[i]);
+      lastLineCount = lines.length;
+      setPbar(estimatePct(lines));
+      if (data.status === 'done') {
+        clearInterval(pollTimer);
+        setPbar(100);
+        document.getElementById('spinner').style.display = 'none';
+        document.getElementById('prog-title').textContent = '✅ Routes generated';
+        routeData = data.route_data;
+        showDone(currentJobId, lines);
+      } else if (data.status === 'error') {
+        clearInterval(pollTimer);
+        document.getElementById('spinner').style.display = 'none';
+        showError(data.error || 'An error occurred');
+      }
+    } catch(_) {}
+  }, 1200);
+}
+
+function showDone(jobId, lines) {
+  setRunning(false);
+  const dlUrl = `/api/download/${jobId}`;
+  document.getElementById('dl-link').href = dlUrl;
+  document.getElementById('dl-link-2').href = dlUrl;
+  document.getElementById('action-bar').style.display = 'flex';
+  if (routeData) {
+    buildResultsTab(routeData, jobId);
+    const badge = document.getElementById('results-badge');
+    badge.textContent = routeData.length;
+    badge.style.display = 'inline-block';
+    try {
+      const campAddr = document.getElementById('camp-address').value.trim();
+      localStorage.setItem('elbow_last_routes', JSON.stringify({
+        vehicles: routeData,
+        savedAt: new Date().toLocaleDateString('en-US', {month:'short', day:'numeric', year:'numeric', hour:'numeric', minute:'2-digit'}),
+        tripDir: tripDirection,
+        campAddr: campAddr,
+      }));
+    } catch(e) {}
+  }
+}
+
+document.getElementById('view-results-btn').addEventListener('click', () => {
+  document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+  document.querySelectorAll('.tab-panel').forEach(p => p.classList.remove('active'));
+  document.querySelector('[data-tab="results"]').classList.add('active');
+  document.getElementById('tab-results').classList.add('active');
+});
+
+// Build results tab
+function buildResultsTab(vehicles, jobId, initEditable=true) {
+  document.getElementById('results-empty').style.display = 'none';
+  document.getElementById('results-content').style.display = 'block';
+  if (jobId) document.getElementById('results-stale').style.display = 'none';
+  if (initEditable) initEditableRoutes(vehicles);
+
+  const totalRiders = vehicles.reduce((s, v) => s + v.rider_count, 0);
+  const totalCap = vehicles.reduce((s, v) => s + v.capacity, 0);
+  const campAddr = document.getElementById('camp-address').value.trim() || '828 Elbow Lane, Warrington, PA';
+  const dirLabel = tripDirection === 'afternoon' ? 'All routes depart from' : 'All routes end at';
+  const tripLabel = tripDirection === 'afternoon' ? '🌇 Afternoon run' : '🌅 Morning run';
+  document.getElementById('summary-hint').textContent =
+    `${tripLabel} · ${totalRiders} riders · ${totalCap} seats · ${vehicles.length} vehicles · Kids ride time = first stop→camp · ${dirLabel} ${campAddr}`;
+
+  const tbody = document.getElementById('summary-tbody');
+  tbody.innerHTML = '';
+  vehicles.forEach(v => {
+    const warn = v.under_threshold;
+    const pct = v.utilization_pct;
+    const barColor = warn ? 'util-warn' : 'util-ok';
+    const badgeCls = warn ? 'badge-warn' : 'badge-ok';
+    const tr = document.createElement('tr');
+    if (warn) tr.className = 'warn';
+    tr.innerHTML = `
+      <td><strong>${v.name}</strong></td>
+      <td style="font-size:.75rem;color:#888;max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${v.corridor || v.start_address}</td>
+      <td><strong>${v.rider_count}</strong> / ${v.capacity}</td>
+      <td>
+        <span class="util-bar-wrap"><span class="util-bar ${barColor}" style="width:${pct}%"></span></span>
+        <span class="badge ${badgeCls}">${pct}%${warn?' ⚠':''}</span>
+      </td>
+      <td>${v.stop_count}</td>
+      <td>${v.total_time}</td>
+      <td>${v.total_distance}</td>
+    `;
+    tbody.appendChild(tr);
+  });
+
+  const totTr = document.createElement('tr');
+  totTr.className = 'summary-totals';
+  totTr.innerHTML = `
+    <td colspan="2"><strong>TOTAL</strong></td>
+    <td><strong>${totalRiders} / ${totalCap}</strong></td>
+    <td><strong>${Math.round(totalRiders/totalCap*100)}%</strong></td>
+    <td><strong>${vehicles.reduce((s,v)=>s+v.stop_count,0)}</strong></td>
+    <td>—</td><td>—</td>
+  `;
+  tbody.appendChild(totTr);
+
+  const unassignedTray = document.getElementById('unassigned-tray');
+  if (unassignedTray) {
+    unassignedTray.classList.remove('visible');
+    const list = document.getElementById('unassigned-list');
+    if (list) list.innerHTML = '';
+  }
+
+  const vehList = document.getElementById('veh-list');
+  vehList.innerHTML = '';
+  vehicles.forEach(v => {
+    const card = document.createElement('div');
+    card.className = 'veh-card' + (v.under_threshold ? ' warn-card' : '');
+    const mapId = `map-${v.name.replace(/\s+/g,'-')}`;
+    const campAddr = document.getElementById('camp-address').value.trim() || '828 Elbow Lane, Warrington, PA';
+    card.innerHTML = `
+      <div class="veh-header">
+        <span class="veh-name">${v.name}</span>
+        <span class="veh-corridor">${v.corridor || v.start_address}</span>
+        <div class="veh-stats">
+          <span class="veh-stat"><strong>${v.rider_count}</strong>/${v.capacity} riders</span>
+          <span class="veh-stat"><strong>${v.utilization_pct}%</strong></span>
+          <span class="veh-stat">${v.total_time}</span>
+          <span class="veh-stat">${v.total_distance}</span>
+        </div>
+        <span class="veh-chevron">▼</span>
+      </div>
+      <div class="veh-body">
+        ${v.under_threshold ? `<div style="background:#fff3cd;border:1px solid #f0c060;border-radius:6px;padding:.6rem .9rem;font-size:.78rem;color:#7a4f00;margin-bottom:.75rem">⚠ This vehicle is below 60% capacity — it serves a geographically isolated area that cannot be merged without splitting neighbour groups.</div>` : ''}
+        <div class="veh-map" id="${mapId}">
+          <div class="map-loading">⏳ Loading map…</div>
+        </div>
+        <div class="edit-bar">
+          <button class="recalc-btn" id="recalc-${v.name.replace(/\s+/g,'-')}" onclick="recalculate()" disabled>
+            ↻ Recalculate Routes
+          </button>
+          <span class="edit-hint">Click ✕ on a rider to remove them from this route</span>
+        </div>
+        <table class="stop-table" id="stop-table-${v.name.replace(/\s+/g,'-')}">
+          <thead><tr><th>#</th><th>Address</th><th>Riders</th><th>Drive Time</th></tr></thead>
+          <tbody>
+            <tr class="stop-row-start">
+              <td class="stop-num">▶</td>
+              <td class="stop-addr" colspan="2">${v.start_address}<div class="stop-city">Departure point</div></td>
+              <td class="stop-time">—</td>
+            </tr>
+            ${v.stops.map((s, si) => {
+              const addrParts = s.address.split(',');
+              const street = addrParts[0] || s.address;
+              const cityState = addrParts.slice(1).join(',').trim();
+              const riderPills = s.rider_names.split(', ')
+                .filter(r => r.trim())
+                .map(r => `<span class="rider-pill" data-rider="${r}" data-vehicle="${v.name}" data-address="${s.address}">
+                  ${r}
+                  <button class="rider-remove" title="Remove ${r}" onclick="removeRider(this, '${v.name}', ${si}, '${r}')">✕</button>
+                </span>`).join('');
+              return `<tr data-address="${s.address}" data-vehicle="${v.name}">
+                <td class="stop-num">${s.stop_num}</td>
+                <td class="stop-addr">${street}<div class="stop-city">${cityState}</div></td>
+                <td class="stop-riders">${riderPills}<br><span class="stop-rider-count" style="font-size:.7rem;color:#aaa">${s.rider_count} rider${s.rider_count!==1?'s':''}</span></td>
+                <td class="stop-time">${s.drive_time}</td>
+              </tr>`;
+            }).join('')}
+            <tr class="stop-row-arrive">
+              <td class="stop-num">⛳</td>
+              <td class="stop-addr" colspan="2">${campAddr}<div class="stop-city">Camp — destination</div></td>
+              <td class="stop-time">${v.last_leg_mins ? v.last_leg_mins + ' min →' : '→'} ARRIVE</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    `;
+
+    let mapInitialised = false;
+    card.querySelector('.veh-header').addEventListener('click', () => {
+      card.classList.toggle('open');
+      if (card.classList.contains('open') && !mapInitialised) {
+        mapInitialised = true;
+        setTimeout(() => initVehicleMap(mapId, v), 200);
+      }
+    });
+    vehList.appendChild(card);
+  });
+}
+
+// Vehicle map
+const initializedMaps = {};
+let googleMapsLoaded = false;
+let googleMapsLoading = false;
+const mapQueue = [];
+
+function loadGoogleMapsAPI() {
+  if (googleMapsLoaded || googleMapsLoading) return;
+  googleMapsLoading = true;
+  const script = document.createElement('script');
+  script.src = `https://maps.googleapis.com/maps/api/js?key=${window.GOOGLE_MAPS_KEY}&libraries=geometry,marker&callback=onGoogleMapsLoaded&v=beta`;
+  script.async = true;
+  document.head.appendChild(script);
+}
+
+window.onGoogleMapsLoaded = function() {
+  googleMapsLoaded = true;
+  googleMapsLoading = false;
+  mapQueue.forEach(fn => fn());
+  mapQueue.length = 0;
+};
+
+function initVehicleMap(mapId, vehicle) {
+  const el = document.getElementById(mapId);
+  if (!el || initializedMaps[mapId]) return;
+  const campAddr = document.getElementById('camp-address').value.trim() || '828 Elbow Lane, Warrington, PA 18976';
+  const allPoints = [];
+
+  vehicle.stops.forEach((s, i) => {
+    const lat = parseFloat(s.lat);
+    const lng = parseFloat(s.lon);
+    if (!isNaN(lat) && !isNaN(lng) && Math.abs(lat) > 0.001 && Math.abs(lng) > 0.001) {
+      allPoints.push({lat, lng, label: String(i+1), type: 'stop', riders: s.rider_names, address: s.address.split(',')[0]});
+    } else {
+      console.warn(`Stop ${i+1} missing coords: ${s.address} lat=${s.lat} lon=${s.lon}`);
+    }
+  });
+
+  const campLat = vehicle.camp_lat || 40.2454;
+  const campLng = vehicle.camp_lon || -75.1407;
+  allPoints.push({lat: campLat, lng: campLng, type: 'camp'});
+
+  if (allPoints.length < 2) {
+    el.innerHTML = '<div class="map-loading">No coordinates available</div>';
+    return;
+  }
+
+  if (!googleMapsLoaded) {
+    loadGoogleMapsAPI();
+    mapQueue.push(() => renderGoogleMap(el, mapId, allPoints, vehicle, campAddr));
+    return;
+  }
+  renderGoogleMap(el, mapId, allPoints, vehicle, campAddr);
+}
+
+async function renderGoogleMap(el, mapId, allPoints, vehicle, campAddr) {
+  el.innerHTML = '';
+  initializedMaps[mapId] = true;
+  const BRAND = '#6D1F2F';
+  const GOLD = '#c9a84c';
+  const GREEN = '#2d6a4f';
+
+  const avgLat = allPoints.reduce((s,p) => s + p.lat, 0) / allPoints.length;
+  const avgLng = allPoints.reduce((s,p) => s + p.lng, 0) / allPoints.length;
+
+  const map = new google.maps.Map(el, {
+    center: {lat: avgLat, lng: avgLng},
+    zoom: 11,
+    mapId: 'elbow_lane_route_map',
+    zoomControl: true,
+    streetViewControl: false,
+    mapTypeControl: false,
+    fullscreenControl: true,
+    mapTypeId: 'roadmap',
+  });
+
+  const infoWindow = new google.maps.InfoWindow();
+  const bounds = new google.maps.LatLngBounds();
+  allPoints.forEach(p => bounds.extend({lat: p.lat, lng: p.lng}));
+
+  const { AdvancedMarkerElement } = await google.maps.importLibrary("marker");
+
+  function drawMarkers() {
+    allPoints.forEach(pt => {
+      const size = pt.type === 'camp' ? 32 : 28;
+      const bg = pt.type === 'camp' ? GREEN : GOLD;
+      const fg = pt.type === 'camp' ? '#fff' : '#1a1018';
+      const lbl = pt.type === 'camp' ? '⛳' : pt.label;
+      const pinEl = document.createElement('div');
+      pinEl.style.cssText = `width:${size}px;height:${size}px;background:${bg};border:2.5px solid #fff;` +
+        `border-radius:50%;display:flex;align-items:center;justify-content:center;` +
+        `font-size:${size<=28?'11':'13'}px;font-weight:700;color:${fg};font-family:Arial;` +
+        `box-shadow:0 2px 8px rgba(0,0,0,.5);cursor:pointer`;
+      pinEl.textContent = lbl;
+      const popup = pt.type === 'camp'
+        ? `<strong>Camp</strong><br>${campAddr}`
+        : `<strong>Stop ${pt.label}</strong><br>${pt.address}<br><em>${pt.riders}</em>`;
+      const m = new AdvancedMarkerElement({position:{lat:pt.lat,lng:pt.lng}, map, content:pinEl, zIndex:200});
+      m.addListener('click', () => { infoWindow.setContent(popup); infoWindow.open(map, m); });
+    });
+    map.fitBounds(bounds, {top:40, right:40, bottom:40, left:40});
+  }
+
+  // Fetch road-following polyline from backend
+  try {
+    const resp = await fetch('/api/route-polyline', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({points: allPoints.map(p => ({lat: p.lat, lng: p.lng}))}),
+    });
+    const data = await resp.json();
+    if (data.errors && data.errors.length > 0) console.warn('Polyline notes:', data.errors);
+    if (data.coords && data.coords.length > 1) {
+      new google.maps.Polyline({
+        path: data.coords, map,
+        strokeColor: BRAND, strokeWeight: 4, strokeOpacity: .85,
+      });
+    } else {
+      new google.maps.Polyline({
+        path: allPoints.map(p => ({lat:p.lat, lng:p.lng})), map,
+        strokeColor: BRAND, strokeWeight: 3, strokeOpacity: .6,
+        icons: [{icon:{path:'M 0,-1 0,1',strokeOpacity:1,scale:3},offset:'0',repeat:'10px'}],
+      });
+    }
+  } catch(e) {
+    console.warn('Route polyline failed:', e);
+    new google.maps.Polyline({
+      path: allPoints.map(p => ({lat:p.lat, lng:p.lng})), map,
+      strokeColor: BRAND, strokeWeight: 3, strokeOpacity: .6,
+      icons: [{icon:{path:'M 0,-1 0,1',strokeOpacity:1,scale:3},offset:'0',repeat:'10px'}],
+    });
+  }
+
+  drawMarkers();
+}
+
+// Manual editing
+let editableRoutes = null;
+let unassignedRiders = [];
+
+function initEditableRoutes(vehicles) {
+  editableRoutes = JSON.parse(JSON.stringify(vehicles));
+}
+
+function removeRider(btn, vehicleName, stopIdx, riderName) {
+  if (!editableRoutes) return;
+  const veh = editableRoutes.find(v => v.name === vehicleName);
+  if (!veh) return;
+  const stop = veh.stops[stopIdx];
+  if (!stop) return;
+  const riderList = stop.rider_names.split(', ').filter(r => r.trim() && r !== riderName);
+  if (riderList.length === 0) {
+    veh.stops.splice(stopIdx, 1);
+  } else {
+    stop.rider_names = riderList.join(', ');
+    stop.rider_count = riderList.length;
+  }
+  unassignedRiders.push({name: riderName, fromVehicle: vehicleName, stopAddress: stop.address, lat: stop.lat, lon: stop.lon});
+  document.getElementById('recalc-bar').classList.add('visible');
+  buildResultsTab(editableRoutes, currentJobId, false);
+  updateUnassignedTray();
+}
+
+function updateUnassignedTray() {
+  const tray = document.getElementById('unassigned-tray');
+  const list = document.getElementById('unassigned-list');
+  if (unassignedRiders.length === 0) { tray.classList.remove('visible'); return; }
+  tray.classList.add('visible');
+  const vehOptions = (editableRoutes || []).map(v => `<option value="${v.name}">${v.name}</option>`).join('');
+  list.innerHTML = unassignedRiders.map((r, i) => `
+    <div class="unassigned-chip">
+      <span>${r.name}</span>
+      <span style="color:#aaa;font-size:.7rem">from ${r.fromVehicle}</span>
+      <select id="assign-select-${i}">
+        <option value="">Assign to...</option>
+        ${vehOptions}
+      </select>
+      <button class="reassign-btn" onclick="assignRider(${i})">Move</button>
+    </div>
+  `).join('');
+}
+
+function assignRider(idx) {
+  const select = document.getElementById(`assign-select-${idx}`);
+  const targetVehicleName = select.value;
+  if (!targetVehicleName || !editableRoutes) return;
+  const rider = unassignedRiders[idx];
+  const targetVeh = editableRoutes.find(v => v.name === targetVehicleName);
+  if (!targetVeh) return;
+  const currentRiders = targetVeh.stops.reduce((s, st) => s + (st.rider_count || 1), 0);
+  if (currentRiders >= targetVeh.capacity) { alert(`${targetVehicleName} is already at full capacity (${targetVeh.capacity} riders)`); return; }
+  const existingStop = targetVeh.stops.find(s => s.address === rider.stopAddress);
+  if (existingStop) {
+    existingStop.rider_names = existingStop.rider_names ? existingStop.rider_names + ', ' + rider.name : rider.name;
+    existingStop.rider_count = (existingStop.rider_count || 0) + 1;
+  } else {
+    targetVeh.stops.push({stop_num: targetVeh.stops.length + 1, address: rider.stopAddress, rider_names: rider.name, rider_count: 1, drive_time: '— recalculate', lat: rider.lat, lon: rider.lon});
+  }
+  unassignedRiders.splice(idx, 1);
+  buildResultsTab(editableRoutes, currentJobId, false);
+  updateUnassignedTray();
+  document.getElementById('recalc-bar').classList.add('visible');
+}
+
+async function recalculate() {
+  if (!editableRoutes || !currentJobId) return;
+  const btn = document.getElementById('recalc-btn');
+  btn.disabled = true;
+  btn.textContent = 'Recalculating…';
+  try {
+    const resp = await fetch(`/api/recalculate/${currentJobId}`, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({vehicles: editableRoutes}),
+    });
+    const data = await resp.json();
+    if (data.error) { alert('Recalculation failed: ' + data.error); return; }
+    routeData = data.route_data;
+    editableRoutes = JSON.parse(JSON.stringify(routeData));
+    unassignedRiders = [];
+    buildResultsTab(editableRoutes, currentJobId, false);
+    updateUnassignedTray();
+    document.getElementById('recalc-bar').classList.remove('visible');
+    document.getElementById('recalc-bar').innerHTML = `
+      <span>✅ Routes recalculated successfully</span>
+      <button class="recalc-btn" id="recalc-btn" onclick="recalculate()">Recalculate Again</button>
+    `;
+    document.getElementById('recalc-bar').classList.add('visible');
+    setTimeout(() => document.getElementById('recalc-bar').classList.remove('visible'), 3000);
+    try {
+      const campAddr = document.getElementById('camp-address').value.trim();
+      localStorage.setItem('elbow_last_routes', JSON.stringify({vehicles: routeData, savedAt: new Date().toLocaleDateString('en-US', {month:'short',day:'numeric',year:'numeric',hour:'numeric',minute:'2-digit'}), tripDir: tripDirection, campAddr: campAddr}));
+    } catch(e) {}
+  } catch(e) {
+    alert('Network error: ' + e.message);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = 'Recalculate Routes';
+  }
+}
+
+// Helpers
+function setRunning(on) {
+  const btn = document.getElementById('run-btn');
+  btn.disabled = on;
+  document.getElementById('run-icon').textContent = on ? '⏳' : '🗺️';
+  document.getElementById('run-label').textContent = on ? 'Generating…' : 'Generate Route Plan';
+  document.getElementById('spinner').style.display = on ? 'block' : 'none';
+}
+
+function appendLog(line) {
+  const div = document.createElement('div');
+  if (line.startsWith('✅')||line.startsWith('✓')||line.startsWith(' ✓')) div.className='ok';
+  else if (line.startsWith('⚠')||line.includes('Purged')||line.includes('warn')) div.className='warn';
+  else if (line.startsWith('❌')) div.className='err';
+  div.textContent = line;
+  const log = document.getElementById('log');
+  log.appendChild(div);
+  log.scrollTop = log.scrollHeight;
+}
+
+function setPbar(pct) { document.getElementById('pbar').style.width = Math.min(100,pct)+'%'; }
+
+function estimatePct(lines) {
+  if (!lines.length) return 5;
+  const last = lines[lines.length-1]||'';
+  if (last.includes('Saved')||last.includes('✅')) return 100;
+  if (last.includes('Sequence')||last.includes('stop')) return 85;
+  if (last.includes('Active')) return 75;
+  if (last.includes('Formed')||last.includes('cluster')) return 50;
+  if (last.includes('Geocoding')||last.includes('Geocoded')) return 20;
+  if (last.includes('Loaded')) return 10;
+  return Math.min(90, 10 + lines.length * 1.5);
+}
+
+function showError(msg) {
+  document.getElementById('error-card').classList.add('visible');
+  document.getElementById('error-msg').textContent = msg;
+  setRunning(false);
+}
+
+async function clearCache() {
+  try {
+    const resp = await fetch('/api/clear-cache', {method: 'POST'});
+    const data = await resp.json();
+    const notice = document.getElementById('cache-notice');
+    notice.style.display = 'block';
+    setTimeout(() => notice.style.display = 'none', 5000);
+  } catch(e) {
+    alert('Could not clear cache: ' + e.message);
+  }
+}
+
+// Init
+renderFleet();
+
+// Load previous results from localStorage
+try {
+  const saved = localStorage.getItem('elbow_last_routes');
+  if (saved) {
+    const parsed = JSON.parse(saved);
+    if (parsed.vehicles && parsed.vehicles.length > 0) {
+      if (parsed.campAddr) document.getElementById('camp-address').value = parsed.campAddr;
+      if (parsed.tripDir) setTrip(parsed.tripDir);
+      document.getElementById('last-run-date').textContent = parsed.savedAt;
+      document.getElementById('results-stale').style.display = 'block';
+      buildResultsTab(parsed.vehicles, null);
+      const badge = document.getElementById('results-badge');
+      badge.textContent = parsed.vehicles.length;
+      badge.style.display = 'inline-block';
+    }
+  }
+} catch(e) {}
+</script>
+</body>
+</html>"""
 
 if __name__ == "__main__":
-    main()
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port, debug=False)
