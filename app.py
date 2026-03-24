@@ -119,6 +119,10 @@ def index():
 def serve_logo():
     return send_from_directory(os.path.dirname(os.path.abspath(__file__)), "logo.png")
 
+@app.route("/healthz")
+def healthz():
+    return "OK", 200
+
 @app.route("/api/run", methods=["POST"])
 def api_run():
     csv_file = request.files.get("csv_file")
