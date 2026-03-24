@@ -230,6 +230,44 @@ def api_clear_cache():
     return jsonify({"cleared": cleared,
                     "message": f"Cleared {len(cleared)} cache files. Next run will re-geocode all addresses using Google Maps."})
 
+SAVED_ADDRESSES_FILE = "saved_addresses.json"
+
+@app.route("/api/saved-addresses", methods=["GET"])
+def api_get_saved_addresses():
+    try:
+        with open(SAVED_ADDRESSES_FILE) as f:
+            return jsonify(json.load(f))
+    except FileNotFoundError:
+        return jsonify([])
+
+@app.route("/api/saved-addresses", methods=["POST"])
+def api_save_address():
+    addr = (request.json or {}).get("address", "").strip()
+    if not addr:
+        return jsonify({"error": "No address provided"}), 400
+    try:
+        with open(SAVED_ADDRESSES_FILE) as f:
+            addresses = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        addresses = []
+    if addr not in addresses:
+        addresses.append(addr)
+        with open(SAVED_ADDRESSES_FILE, "w") as f:
+            json.dump(addresses, f, indent=2)
+    return jsonify({"ok": True, "addresses": addresses})
+
+@app.route("/api/saved-addresses/<path:addr>", methods=["DELETE"])
+def api_delete_saved_address(addr):
+    try:
+        with open(SAVED_ADDRESSES_FILE) as f:
+            addresses = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        addresses = []
+    addresses = [a for a in addresses if a != addr]
+    with open(SAVED_ADDRESSES_FILE, "w") as f:
+        json.dump(addresses, f, indent=2)
+    return jsonify({"ok": True, "addresses": addresses})
+
 @app.route("/api/status/<job_id>")
 def api_status(job_id: str):
     with jobs_lock:
@@ -791,6 +829,7 @@ onblur="this.style.borderColor='var(--border)';this.style.background='var(--mist
 <div class="fleet-col-label">
 <span>Vehicle</span><span>Starting Address</span><span>Capacity</span><span></span>
 </div>
+<datalist id="addr-suggestions"></datalist>
 <div class="fleet-builder" id="fleet-builder"></div>
 <button class="add-vehicle-btn" id="add-vehicle-btn">＋ Add Vehicle</button>
 <div class="fleet-summary" id="fleet-summary"></div>
@@ -918,7 +957,7 @@ function renderFleet() {
         ${VEHICLE_NAMES.map(n => `<option value="${n}" ${n===veh.name?'selected':''}>${n}</option>`).join('')}
       </select>
       <input type="text" placeholder="e.g. 828 Elbow Lane, Warrington, PA"
-        value="${veh.address}" data-idx="${i}" data-field="address">
+        value="${veh.address}" data-idx="${i}" data-field="address" list="addr-suggestions" autocomplete="off">
       <select data-idx="${i}" data-field="capacity">
         ${CAPACITIES.map(c => `<option value="${c}" ${c===veh.capacity?'selected':''}>${c} riders</option>`).join('')}
       </select>
@@ -1074,6 +1113,8 @@ document.getElementById('run-btn').addEventListener('click', async () => {
   setPbar(0); lastLineCount = 0;
   setRunning(true);
   document.getElementById('prog-panel').classList.add('visible');
+
+  saveFleetAddresses();
 
   const fd = new FormData();
   fd.append('csv_file', csvFile);
@@ -1576,8 +1617,39 @@ async function clearCache() {
   }
 }
 
+// Saved addresses autocomplete
+let savedAddresses = [];
+
+async function loadSavedAddresses() {
+  try {
+    const res = await fetch('/api/saved-addresses');
+    savedAddresses = await res.json();
+    const dl = document.getElementById('addr-suggestions');
+    dl.innerHTML = savedAddresses
+      .map(a => `<option value="${a.replace(/"/g, '&quot;')}">`)
+      .join('');
+  } catch(e) { /* non-critical */ }
+}
+
+async function saveFleetAddresses() {
+  const addrs = fleet.map(v => v.address.trim()).filter(a => a.length > 5);
+  for (const addr of addrs) {
+    if (!savedAddresses.includes(addr)) {
+      try {
+        await fetch('/api/saved-addresses', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({address: addr})
+        });
+      } catch(e) { /* non-critical */ }
+    }
+  }
+  await loadSavedAddresses();
+}
+
 // Init
 renderFleet();
+loadSavedAddresses();
 
 // Load previous results from localStorage
 try {

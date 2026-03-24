@@ -621,7 +621,9 @@ def parse_vehicles_text(text: str) -> list:
 # -----------------------------------------------------------------------------
 
 def _sequence_stops_camp_directional(stops: list, camp_lat: float, camp_lon: float,
-                                      trip_direction: str = "morning") -> list:
+                                      trip_direction: str = "morning",
+                                      garage_lat: float = None,
+                                      garage_lon: float = None) -> list:
     if len(stops) <= 1:
         return list(stops)
 
@@ -647,11 +649,15 @@ def _sequence_stops_camp_directional(stops: list, camp_lat: float, camp_lon: flo
             ref_d = d2c(s)
     tiers.append(current_tier)
 
+    # Start nearest-neighbor from garage if provided, else first tier centroid
+    if garage_lat is not None and garage_lon is not None:
+        last_lat, last_lon = garage_lat, garage_lon
+    else:
+        last_lat = sum(s.lat for s in tiers[0]) / len(tiers[0])
+        last_lon = sum(s.lon for s in tiers[0]) / len(tiers[0])
+
     # Within each tier, use nearest-neighbor
     result = []
-    last_lat = sum(s.lat for s in tiers[0]) / len(tiers[0])
-    last_lon = sum(s.lon for s in tiers[0]) / len(tiers[0])
-
     for tier in tiers:
         remaining = list(tier)
         while remaining:
@@ -660,6 +666,28 @@ def _sequence_stops_camp_directional(stops: list, camp_lat: float, camp_lon: flo
             result.append(nearest)
             last_lat, last_lon = nearest.lat, nearest.lon
             remaining.remove(nearest)
+
+    # 2-opt improvement: iteratively swap pairs of edges to eliminate crossovers
+    # Full route evaluated as: garage -> stops -> camp
+    r_lat = garage_lat if garage_lat is not None else result[0].lat
+    r_lon = garage_lon if garage_lon is not None else result[0].lon
+
+    def _route_dist(seq):
+        pts = ([(r_lat, r_lon)]
+               + [(s.lat, s.lon) for s in seq]
+               + [(camp_lat, camp_lon)])
+        return sum(haversine_mi(pts[i][0], pts[i][1], pts[i+1][0], pts[i+1][1])
+                   for i in range(len(pts) - 1))
+
+    improved = True
+    while improved:
+        improved = False
+        for i in range(len(result) - 1):
+            for k in range(i + 2, len(result)):
+                candidate = result[:i+1] + result[i+1:k+1][::-1] + result[k+1:]
+                if _route_dist(candidate) < _route_dist(result):
+                    result = candidate
+                    improved = True
 
     return result
 
@@ -780,7 +808,7 @@ def cluster_and_route(students: list, vehicles: list,
         fits = [i for i in range(len(veh_objects)) if veh_objects[i].capacity - counts[i] >= sz]
         if fits:
             return min(fits, key=lambda i: counts[i])
-        return min(range(len(veh_objects)), key=lambda i: veh_objects[i].capacity - counts[i])
+        return max(range(len(veh_objects)), key=lambda i: veh_objects[i].capacity - counts[i])
 
     for cl in assignable:
         sz = cl_size(cl)
@@ -791,8 +819,8 @@ def cluster_and_route(students: list, vehicles: list,
         counts[vi] += sz
         veh_bearings[vi].append(cl_b)
 
-    # -- 5b. Consolidation ----------------------------------------------------
-    changed, passes = True, 0
+    # -- 5b. Consolidation (disabled: all defined vehicles are kept) ----------
+    changed, passes = False, 0
     while changed and passes < 30:
         changed, passes = False, passes + 1
 
@@ -944,7 +972,8 @@ def cluster_and_route(students: list, vehicles: list,
                 progress_cb(f"  Stop has no coordinates: {zs.address}")
 
         sorted_stops = _sequence_stops_camp_directional(
-            list(addr_stop.values()), camp_lat, camp_lon, trip_direction)
+            list(addr_stop.values()), camp_lat, camp_lon, trip_direction,
+            garage_lat=veh.start_lat, garage_lon=veh.start_lon)
 
         # coord sequence: [garage, stop1, ..., stopN, camp]
         coord_seq = ([(veh.start_lat, veh.start_lon)]
