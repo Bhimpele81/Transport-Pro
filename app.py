@@ -1,5 +1,5 @@
 """
-Elbow Lane Day Camp - Bus Route Optimizer
+Elbow Lane Day Camp — Bus Route Optimizer
 Flask web application with fleet builder UI and in-app route viewer.
 Run with: python app.py
 """
@@ -14,10 +14,6 @@ from bus_route_optimizer import (
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 5 * 1024 * 1024
 
-@app.route("/healthz")
-def healthz():
-    return "OK", 200
-
 jobs: dict = {}
 jobs_lock = threading.Lock()
 
@@ -26,7 +22,7 @@ os.makedirs("outputs", exist_ok=True)
 
 CAMP_COORDS = (40.2454, -75.1407)
 
-# Serialise route data for JSON API
+# ── Serialise route data for JSON API ─────────────────────────────────────────
 
 def vehicles_to_json(vehicles: list) -> list:
     out = []
@@ -46,6 +42,7 @@ def vehicles_to_json(vehicles: list) -> list:
             "start_lon": v.start_lon,
             "camp_lat": getattr(v, "camp_lat", 40.2454),
             "camp_lon": getattr(v, "camp_lon", -75.1407),
+            "last_leg_mins": getattr(v, "last_leg_mins", 0),
             "stops": [
                 {
                     "stop_num": i + 1,
@@ -61,7 +58,7 @@ def vehicles_to_json(vehicles: list) -> list:
         })
     return out
 
-# Background worker
+# ── Background worker ──────────────────────────────────────────────────────────
 
 def run_job(job_id: str, csv_text: str, vehicles_text: str,
             camp_address: str = None, trip_direction: str = "morning"):
@@ -88,7 +85,7 @@ def run_job(job_id: str, csv_text: str, vehicles_text: str,
         for veh in vehicles:
             build_vehicle_sheet(wb, veh, camp_address=camp_address, trip_direction=trip_direction)
         wb.save(output_path)
-        progress("Excel saved")
+        progress("✅ Excel saved")
 
         camp_lat_val = vehicles[0].camp_lat if vehicles else CAMP_COORDS[0]
         camp_lon_val = vehicles[0].camp_lon if vehicles else CAMP_COORDS[1]
@@ -107,9 +104,9 @@ def run_job(job_id: str, csv_text: str, vehicles_text: str,
         with jobs_lock:
             jobs[job_id]["status"] = "error"
             jobs[job_id]["error"] = str(e)
-        progress(f"Error: {e}")
+        progress(f"❌ Error: {e}")
 
-# API routes
+# ── API routes ─────────────────────────────────────────────────────────────────
 
 @app.route("/")
 def index():
@@ -162,7 +159,7 @@ def api_run():
     with jobs_lock:
         jobs[job_id] = {
             "status": "queued",
-            "progress": [f"Loaded {len(students)} students, {len(vcfgs)} vehicles"],
+            "progress": [f"✓ Loaded {len(students)} students, {len(vcfgs)} vehicles"],
             "output_path": None,
             "route_data": None,
             "error": None,
@@ -180,9 +177,10 @@ def api_run():
 
 @app.route("/api/debug-coords")
 def api_debug_coords():
+    """Show all cached coordinates — helps diagnose missing map stops."""
     geocache_file = "geocache.json"
     if not os.path.exists(geocache_file):
-        return jsonify({"error": "No geocache found - run routes first"}), 404
+        return jsonify({"error": "No geocache found — run routes first"}), 404
 
     with open(geocache_file) as f:
         cache = json.load(f)
@@ -203,6 +201,7 @@ def api_debug_coords():
 
 @app.route("/api/clear-cache", methods=["POST"])
 def api_clear_cache():
+    """Delete geocache and routecache so all addresses are re-geocoded fresh."""
     cleared = []
     for f in ["geocache.json", "routecache.json"]:
         if os.path.exists(f):
@@ -226,6 +225,7 @@ def api_status(job_id: str):
 
 @app.route("/api/recalculate/<job_id>", methods=["POST"])
 def api_recalculate(job_id: str):
+    """Accept manually edited route data, recompute drive times, regenerate Excel."""
     with jobs_lock:
         job = jobs.get(job_id)
     if not job:
@@ -253,7 +253,7 @@ def api_recalculate(job_id: str):
                 self.rider_count = int(d.get("rider_count", 0))
                 self.lat = float(d.get("lat", 0) or 0)
                 self.lon = float(d.get("lon", 0) or 0)
-                self.drive_time = d.get("drive_time", "-")
+                self.drive_time = d.get("drive_time", "—")
                 self.geocoded = True
 
         vehicles = []
@@ -266,8 +266,8 @@ def api_recalculate(job_id: str):
                 start_address=vd["start_address"],
                 capacity=vd["capacity"],
                 stops=stops,
-                total_time=vd.get("total_time", "-"),
-                total_distance=vd.get("total_distance", "-"),
+                total_time=vd.get("total_time", "—"),
+                total_distance=vd.get("total_distance", "—"),
                 under_threshold=vd.get("under_threshold", False),
                 start_lat=vd.get("start_lat", 0.0),
                 start_lon=vd.get("start_lon", 0.0),
@@ -275,12 +275,14 @@ def api_recalculate(job_id: str):
                 camp_lon=vd.get("camp_lon", CC[1]),
             )
 
+            # Resequence using two-phase camp-directional algorithm
             if len(veh.stops) > 1:
                 camp_lat = veh.camp_lat or CC[0]
                 camp_lon = veh.camp_lon or CC[1]
                 veh.stops = _sequence_stops_camp_directional(
                     veh.stops, camp_lat, camp_lon, trip_direction)
 
+            # Recalculate drive times
             if veh.stops and (veh.start_lat or veh.start_lon):
                 camp_lat = veh.camp_lat or CC[0]
                 camp_lon = veh.camp_lon or CC[1]
@@ -293,6 +295,7 @@ def api_recalculate(job_id: str):
                     mins = max(1, round(legs[i]))
                     stop.drive_time = f"{mins} min from start" if i == 0 else f"{mins} min"
 
+                # Kids ride time excludes garage deadhead
                 kids_mins = round(sum(legs[1:]))
                 hrs, rem = divmod(kids_mins, 60)
                 veh.total_time = (f"{hrs} hr {rem} min" if hrs and rem
@@ -310,6 +313,7 @@ def api_recalculate(job_id: str):
 
             vehicles.append(veh)
 
+        # Regenerate Excel
         output_path = os.path.join("outputs", f"routes_{job_id}_edited.xlsx")
         wb = Workbook()
         build_dashboard(wb, vehicles, camp_address=camp_address, trip_direction=trip_direction)
@@ -327,10 +331,16 @@ def api_recalculate(job_id: str):
         import traceback
         return jsonify({"error": str(e), "trace": traceback.format_exc()}), 500
 
-# Route polyline endpoint
+# ── Route polyline endpoint (road-following lines for map display) ─────────────
 
 @app.route("/api/route-polyline", methods=["POST"])
 def api_route_polyline():
+    """
+    Given an ordered list of {lat, lng} points, returns road-following
+    polyline coordinates by calling the Google Directions API.
+    Falls back to returning the original straight-line coords if API fails,
+    so the map always draws something.
+    """
     data = {}
     try:
         data = request.get_json(force=True) or {}
@@ -343,7 +353,7 @@ def api_route_polyline():
         if not google_key:
             return jsonify({
                 "coords": [{"lat": p["lat"], "lng": p["lng"]} for p in points],
-                "errors": ["No Google Maps key - using straight lines"]
+                "errors": ["No Google Maps key — using straight lines"]
             })
 
         origin = f"{points[0]['lat']},{points[0]['lng']}"
@@ -359,6 +369,7 @@ def api_route_polyline():
             if err:
                 errors.append(err)
         else:
+            # Too many waypoints — split into chunks of 23
             chunk_size = 23
             prev_point = points[0]
             remaining = points[1:]
@@ -373,12 +384,13 @@ def api_route_polyline():
                     errors.append(err)
                 if coords:
                     if all_coords:
-                        coords = coords[1:]
+                        coords = coords[1:]  # avoid duplicate junction point
                     all_coords.extend(coords)
                 prev_point = chunk[-1]
                 remaining = remaining[chunk_size + 1:]
 
         if not all_coords:
+            # Complete fallback — return straight line coords so map still draws
             return jsonify({
                 "coords": [{"lat": p["lat"], "lng": p["lng"]} for p in points],
                 "errors": errors or ["Directions API returned no route"]
@@ -387,6 +399,7 @@ def api_route_polyline():
         return jsonify({"coords": all_coords, "errors": errors})
 
     except Exception as e:
+        # Always return 200 with fallback coords so frontend doesn't break
         return jsonify({
             "coords": [{"lat": p["lat"], "lng": p["lng"]} for p in data.get("points", [])],
             "errors": [str(e)]
@@ -394,6 +407,10 @@ def api_route_polyline():
 
 
 def _fetch_directions_polyline(origin, destination, waypoints, google_key):
+    """
+    Call Google Directions API and decode the step-level polylines.
+    Returns (list_of_lat_lng_dicts, error_string_or_None).
+    """
     params = {
         "origin": origin,
         "destination": destination,
@@ -413,7 +430,7 @@ def _fetch_directions_polyline(origin, destination, waypoints, google_key):
             result = json.loads(resp.read().decode())
 
         if result.get("status") != "OK":
-            return [], (f"Directions API status: {result.get('status')} - "
+            return [], (f"Directions API status: {result.get('status')} — "
                         f"{result.get('error_message', '')}")
 
         coords = []
@@ -421,7 +438,7 @@ def _fetch_directions_polyline(origin, destination, waypoints, google_key):
             for step in leg["steps"]:
                 decoded = _decode_polyline(step["polyline"]["points"])
                 if coords:
-                    decoded = decoded[1:]
+                    decoded = decoded[1:]  # remove duplicate junction point
                 coords.extend(decoded)
 
         return coords, None
@@ -431,12 +448,17 @@ def _fetch_directions_polyline(origin, destination, waypoints, google_key):
 
 
 def _decode_polyline(encoded):
+    """
+    Decode a Google Maps encoded polyline string into a list of
+    {"lat": float, "lng": float} dicts.
+    """
     coords = []
     index = 0
     lat = 0
     lng = 0
 
     while index < len(encoded):
+        # Decode latitude delta
         result = 0
         shift = 0
         while True:
@@ -448,6 +470,7 @@ def _decode_polyline(encoded):
                 break
         lat += ~(result >> 1) if (result & 1) else (result >> 1)
 
+        # Decode longitude delta
         result = 0
         shift = 0
         while True:
@@ -463,7 +486,7 @@ def _decode_polyline(encoded):
 
     return coords
 
-# Download
+# ── Download ───────────────────────────────────────────────────────────────────
 
 @app.route("/api/download/<job_id>")
 def api_download(job_id: str):
@@ -478,7 +501,7 @@ def api_download(job_id: str):
         mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
 
-# HTML
+# ── HTML ───────────────────────────────────────────────────────────────────────
 
 HTML = r"""<!DOCTYPE html>
 <html lang="en">
@@ -486,9 +509,9 @@ HTML = r"""<!DOCTYPE html>
 <meta charset="UTF-8">
 <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
 <meta http-equiv="Pragma" content="no-cache">
-<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>&#x1F68C;</text></svg>">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🚌</text></svg>">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Elbow Lane - Bus Route Optimizer</title>
+<title>Elbow Lane — Bus Route Optimizer</title>
 <script>
 window.GOOGLE_MAPS_KEY = "{{ google_maps_key }}";
 </script>
@@ -512,6 +535,7 @@ window.GOOGLE_MAPS_KEY = "{{ google_maps_key }}";
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
 body{font-family:'DM Sans',sans-serif;background:var(--mist);color:var(--ink);min-height:100vh}
 header{background:var(--brand);color:#fff;padding:0 2rem;display:flex;align-items:center;gap:1.25rem;height:80px;box-shadow:0 2px 16px rgba(109,31,47,.35);position:sticky;top:0;z-index:200}
+.h-logo{width:60px;height:60px;flex-shrink:0;border-radius:50%;background-image:url("data:image/png;base64,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");background-size:90%;background-position:center;background-repeat:no-repeat;background-color:var(--brand-dark)}
 .h-title{font-family:'Roboto Slab',serif;font-size:1.25rem;font-weight:700;letter-spacing:.02em;text-transform:uppercase}
 .h-sub{font-size:.72rem;opacity:.75;font-weight:400;margin-top:2px;letter-spacing:.08em;text-transform:uppercase}
 .h-badge{margin-left:auto;background:rgba(255,255,255,.15);border:1px solid rgba(255,255,255,.3);color:#fff;font-size:.68rem;font-family:'Roboto Slab',serif;font-weight:500;letter-spacing:.12em;text-transform:uppercase;padding:.35rem .9rem;border-radius:20px;white-space:nowrap}
@@ -654,6 +678,7 @@ label.lbl{display:block;font-size:.75rem;font-weight:600;color:var(--brand-dark)
 .veh-stats{display:none}
 .tab span:not(.tab-badge){display:none}
 header{padding:0 1rem;gap:.75rem;height:64px}
+.h-logo{width:46px;height:46px}
 .h-title{font-size:1rem}
 .h-sub{display:none}
 .h-badge{display:none}
@@ -671,6 +696,7 @@ header{padding:0 1rem;gap:.75rem;height:64px}
 </head>
 <body>
 <header>
+<div class="h-logo" role="img" aria-label="Elbow Lane Day Camp"></div>
 <div>
 <div class="h-title">Elbow Lane Day Camp</div>
 <div class="h-sub">Bus Route Optimizer</div>
@@ -678,14 +704,15 @@ header{padding:0 1rem;gap:.75rem;height:64px}
 <span class="h-badge">Route Planner</span>
 </header>
 <div class="tab-bar">
-<div class="tab active" data-tab="setup">Setup</div>
-<div class="tab" data-tab="results">Results <span class="tab-badge" id="results-badge" style="display:none">0</span></div>
+<div class="tab active" data-tab="setup">⚙️ <span>Setup</span></div>
+<div class="tab" data-tab="results">📊 <span>Results</span> <span class="tab-badge" id="results-badge" style="display:none">0</span></div>
 </div>
 <div class="container">
+<!-- SETUP TAB -->
 <div class="tab-panel active" id="tab-setup">
 <div class="card">
 <div class="card-hd">
-<span class="card-num" style="background:var(--gold);color:#1a1018">*</span>
+<span class="card-num" style="background:var(--gold);color:#1a1018">★</span>
 <div>
 <div class="card-title">Trip Settings</div>
 <div class="card-hint">Set the camp location and whether this is a morning or afternoon run</div>
@@ -722,15 +749,15 @@ onblur="this.style.borderColor='var(--border)';this.style.background='var(--mist
 </div>
 <div class="drop-zone" id="drop-zone">
 <input type="file" id="csv-file" accept=".csv">
-<div class="drop-icon">&#x1F4CB;</div>
-<div class="drop-text"><strong>Click to choose</strong> or drag and drop your CSV file</div>
+<div class="drop-icon">📋</div>
+<div class="drop-text"><strong>Click to choose</strong> or drag &amp; drop your CSV file</div>
 <div class="drop-meta">Required columns: Last name | First name | Address | City | Zip</div>
 </div>
 <div class="file-chosen" id="file-chosen">
-<span>OK</span>
-<span id="file-name">-</span>
+<span>✅</span>
+<span id="file-name">—</span>
 <span id="file-rows" style="color:#888;font-weight:400"></span>
-<button class="rm" id="remove-file">X</button>
+<button class="rm" id="remove-file">✕</button>
 </div>
 </div>
 <div class="card">
@@ -745,31 +772,31 @@ onblur="this.style.borderColor='var(--border)';this.style.background='var(--mist
 <span>Vehicle</span><span>Starting Address</span><span>Capacity</span><span></span>
 </div>
 <div class="fleet-builder" id="fleet-builder"></div>
-<button class="add-vehicle-btn" id="add-vehicle-btn">+ Add Vehicle</button>
+<button class="add-vehicle-btn" id="add-vehicle-btn">＋ Add Vehicle</button>
 <div class="fleet-summary" id="fleet-summary"></div>
 <div id="capacity-warning" style="display:none;margin-top:.75rem;background:#fff3cd;border:1px solid #f0c060;border-radius:8px;padding:.75rem 1rem;font-size:.84rem;color:#7a4f00;align-items:center;gap:.6rem">
-<span style="font-size:1.1rem">!</span>
+<span style="font-size:1.1rem">⚠️</span>
 <span id="capacity-warning-msg"></span>
 </div>
 </div>
 <button class="run-btn" id="run-btn" disabled>
-<span id="run-icon">Map</span>
+<span id="run-icon">🗺️</span>
 <span id="run-label">Generate Route Plan</span>
 </button>
 <div id="prog-panel">
 <div class="prog-hd">
 <div class="spinner" id="spinner"></div>
-<span class="prog-title" id="prog-title">Optimizing routes...</span>
+<span class="prog-title" id="prog-title">Optimizing routes…</span>
 </div>
 <div class="pbar-wrap"><div class="pbar" id="pbar"></div></div>
 <div id="log"></div>
 </div>
 <div class="action-bar" id="action-bar" style="display:none">
-<a class="dl-btn" id="dl-link" href="#" download>Download Excel</a>
-<button class="view-btn" id="view-results-btn">View Results</button>
+<a class="dl-btn" id="dl-link" href="#" download>⬇ Download Excel</a>
+<button class="view-btn" id="view-results-btn">📊 View Results</button>
 </div>
 <div id="cache-notice" style="display:none;margin-top:.6rem;background:#fff3cd;border:1px solid #f0c060;border-radius:8px;padding:.6rem 1rem;font-size:.78rem;color:#7a4f00">
-Cache cleared - next run will re-geocode all addresses with Google Maps.
+✅ Cache cleared — next run will re-geocode all addresses with Google Maps.
 </div>
 <div style="text-align:right;margin-top:.4rem">
 <button onclick="clearCache()" style="background:none;border:none;color:#aaa;font-size:.72rem;cursor:pointer;text-decoration:underline">Clear geocache (fixes wrong map locations)</button>
@@ -778,28 +805,29 @@ Cache cleared - next run will re-geocode all addresses with Google Maps.
 <strong>Something went wrong</strong>
 <span id="error-msg"></span>
 </div>
-</div>
+</div><!-- /setup tab -->
 
+<!-- RESULTS TAB -->
 <div class="tab-panel" id="tab-results">
 <div id="results-empty" class="results-empty">
-<div class="empty-icon">Map</div>
+<div class="empty-icon">🗺️</div>
 <p>No routes generated yet.<br>Go to <strong>Setup</strong> and click <em>Generate Route Plan</em>.</p>
 </div>
 <div id="results-stale" style="display:none">
 <div style="background:var(--brand-light);border:1px solid #d4a0aa;border-radius:8px;padding:.6rem 1rem;font-size:.78rem;color:var(--brand-dark);margin-bottom:1rem;display:flex;align-items:center;gap:.5rem">
-<span>Results</span>
-<span>Showing results from your last run on <strong id="last-run-date"></strong> - generate a new plan to update</span>
+<span>📋</span>
+<span>Showing results from your last run on <strong id="last-run-date"></strong> — generate a new plan to update</span>
 </div>
 </div>
 <div id="results-content" style="display:none">
 <div class="card" id="summary-card">
 <div class="card-hd">
-<span style="font-size:1.3rem">Summary</span>
+<span style="font-size:1.3rem">📊</span>
 <div>
 <div class="card-title">Route Summary</div>
 <div class="card-hint" id="summary-hint"></div>
 </div>
-<a class="dl-btn" id="dl-link-2" href="#" download style="margin-left:auto;padding:.5rem 1rem;font-size:.8rem">Excel</a>
+<a class="dl-btn" id="dl-link-2" href="#" download style="margin-left:auto;padding:.5rem 1rem;font-size:.8rem">⬇ Excel</a>
 </div>
 <div style="overflow-x:auto">
 <table class="summary-table" id="summary-table">
@@ -819,17 +847,17 @@ Cache cleared - next run will re-geocode all addresses with Google Maps.
 </div>
 </div>
 <div class="recalc-bar" id="recalc-bar">
-<span>You have unsaved changes - recalculate to update times and Excel</span>
+<span>✏️ You have unsaved changes — recalculate to update times and Excel</span>
 <button class="recalc-btn" id="recalc-btn" onclick="recalculate()">Recalculate Routes</button>
 </div>
 <div class="unassigned-tray" id="unassigned-tray">
-<div class="unassigned-title">Unassigned Students</div>
+<div class="unassigned-title">⚠ Unassigned Students</div>
 <div class="unassigned-list" id="unassigned-list"></div>
 </div>
 <div class="veh-list" id="veh-list"></div>
 </div>
-</div>
-</div>
+</div><!-- /results tab -->
+</div><!-- /container -->
 
 <script>
 const VEHICLE_NAMES = ['Vehicle A','Vehicle B','Vehicle C','Vehicle D','Vehicle E',
@@ -846,6 +874,7 @@ let pollTimer = null;
 let lastLineCount = 0;
 let routeData = null;
 
+// Tabs
 document.querySelectorAll('.tab').forEach(tab => {
   tab.addEventListener('click', () => {
     document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
@@ -855,6 +884,7 @@ document.querySelectorAll('.tab').forEach(tab => {
   });
 });
 
+// Fleet Builder
 const builder = document.getElementById('fleet-builder');
 let fleet = JSON.parse(JSON.stringify(DEFAULT_FLEET));
 
@@ -863,15 +893,17 @@ function renderFleet() {
   fleet.forEach((veh, i) => {
     const row = document.createElement('div');
     row.className = 'fleet-row';
-    row.innerHTML =
-      '<select data-idx="' + i + '" data-field="name">' +
-      VEHICLE_NAMES.map(n => '<option value="' + n + '"' + (n===veh.name?' selected':'') + '>' + n + '</option>').join('') +
-      '</select>' +
-      '<input type="text" placeholder="e.g. 828 Elbow Lane, Warrington, PA" value="' + veh.address + '" data-idx="' + i + '" data-field="address">' +
-      '<select data-idx="' + i + '" data-field="capacity">' +
-      CAPACITIES.map(c => '<option value="' + c + '"' + (c===veh.capacity?' selected':'') + '>' + c + ' riders</option>').join('') +
-      '</select>' +
-      '<button class="rm-row" data-idx="' + i + '" title="Remove">X</button>';
+    row.innerHTML = `
+      <select data-idx="${i}" data-field="name">
+        ${VEHICLE_NAMES.map(n => `<option value="${n}" ${n===veh.name?'selected':''}>${n}</option>`).join('')}
+      </select>
+      <input type="text" placeholder="e.g. 828 Elbow Lane, Warrington, PA"
+        value="${veh.address}" data-idx="${i}" data-field="address">
+      <select data-idx="${i}" data-field="capacity">
+        ${CAPACITIES.map(c => `<option value="${c}" ${c===veh.capacity?'selected':''}>${c} riders</option>`).join('')}
+      </select>
+      <button class="rm-row" data-idx="${i}" title="Remove">✕</button>
+    `;
     builder.appendChild(row);
   });
   updateFleetSummary();
@@ -901,7 +933,7 @@ builder.addEventListener('click', e => {
 
 document.getElementById('add-vehicle-btn').addEventListener('click', () => {
   const used = new Set(fleet.map(v => v.name));
-  const next = VEHICLE_NAMES.find(n => !used.has(n)) || ('Vehicle ' + (fleet.length + 1));
+  const next = VEHICLE_NAMES.find(n => !used.has(n)) || `Vehicle ${fleet.length + 1}`;
   fleet.push({name: next, address: '', capacity: 13});
   renderFleet();
 });
@@ -911,14 +943,15 @@ function updateFleetSummary() {
   const total = fleet.reduce((s, v) => s + v.capacity, 0);
   const filled = fleet.filter(v => v.address.trim()).length;
   const seatsOk = studentCount === 0 || total >= studentCount;
-  summary.innerHTML =
-    '<span class="fleet-chip">Vehicles: ' + fleet.length + '</span>' +
-    '<span class="fleet-chip" style="' + (!seatsOk ? 'background:#fde8e8;border-color:#e07070;color:#7a1f1f' : '') + '">' +
-    'Seats: ' + total + (studentCount > 0 ? ' / ' + studentCount + ' needed' : '') +
-    '</span>' +
-    '<span class="fleet-chip" style="' + (filled < fleet.length ? 'background:#fff3cd;border-color:#f0c060' : '') + '">' +
-    'Addresses: ' + filled + '/' + fleet.length +
-    '</span>';
+  summary.innerHTML = `
+    <span class="fleet-chip">🚌 ${fleet.length} vehicles</span>
+    <span class="fleet-chip" style="${!seatsOk ? 'background:#fde8e8;border-color:#e07070;color:#7a1f1f' : ''}">
+      💺 ${total} total seats${studentCount > 0 ? ' / ' + studentCount + ' needed' : ''}
+    </span>
+    <span class="fleet-chip" style="${filled < fleet.length ? 'background:#fff3cd;border-color:#f0c060' : ''}">
+      📍 ${filled}/${fleet.length} addresses entered
+    </span>
+  `;
   checkCapacity();
 }
 
@@ -928,7 +961,7 @@ function checkCapacity() {
   const msg = document.getElementById('capacity-warning-msg');
   if (studentCount > 0 && total < studentCount) {
     const needed = studentCount - total;
-    msg.textContent = 'Not enough seats - you have ' + total + ' seats for ' + studentCount + ' students. Add ' + needed + ' more seat' + (needed !== 1 ? 's' : '') + ' by increasing vehicle capacities or adding another vehicle.';
+    msg.textContent = `Not enough seats — you have ${total} seats for ${studentCount} students. Add ${needed} more seat${needed !== 1 ? 's' : ''} by increasing vehicle capacities or adding another vehicle.`;
     warning.style.display = 'flex';
   } else {
     warning.style.display = 'none';
@@ -938,10 +971,11 @@ function checkCapacity() {
 
 function fleetToText() {
   return fleet.map(v =>
-    v.name + ': Start: ' + (v.address || '828 Elbow Lane, Warrington, PA') + ' - Capacity: ' + v.capacity + ' riders'
+    `${v.name}: Start: ${v.address || '828 Elbow Lane, Warrington, PA'} - Capacity: ${v.capacity} riders`
   ).join('\n');
 }
 
+// CSV upload
 const dropZone = document.getElementById('drop-zone');
 const csvInput = document.getElementById('csv-file');
 const fileChosen = document.getElementById('file-chosen');
@@ -970,12 +1004,12 @@ function setFile(file) {
   reader.onload = e => {
     const lines = e.target.result.split('\n').filter(l => l.trim()).length;
     studentCount = lines - 1;
-    document.getElementById('file-rows').textContent = studentCount + ' students';
+    document.getElementById('file-rows').textContent = `· ${studentCount} students`;
     checkCapacity();
   };
   reader.readAsText(file);
   fileChosen.classList.add('visible');
-  dropZone.querySelector('.drop-icon').textContent = 'OK';
+  dropZone.querySelector('.drop-icon').textContent = '✅';
   updateRunBtn();
 }
 
@@ -992,7 +1026,7 @@ document.getElementById('remove-file').addEventListener('click', e => {
   e.stopPropagation(); csvFile = null; csvInput.value = '';
   studentCount = 0;
   fileChosen.classList.remove('visible');
-  dropZone.querySelector('.drop-icon').textContent = 'CSV';
+  dropZone.querySelector('.drop-icon').textContent = '📋';
   document.getElementById('capacity-warning').style.display = 'none';
   updateRunBtn();
 });
@@ -1006,12 +1040,13 @@ function updateRunBtn() {
   const label = document.getElementById('run-label');
   btn.disabled = !(hasCSV && hasAddresses && hasEnoughSeats);
   if (hasCSV && hasAddresses && !hasEnoughSeats) {
-    label.textContent = 'Not enough seats (' + totalSeats + ' / ' + studentCount + ' needed)';
+    label.textContent = `Not enough seats (${totalSeats} / ${studentCount} needed)`;
   } else {
     label.textContent = 'Generate Route Plan';
   }
 }
 
+// Run
 document.getElementById('run-btn').addEventListener('click', async () => {
   document.getElementById('action-bar').style.display = 'none';
   document.getElementById('error-card').classList.remove('visible');
@@ -1031,17 +1066,18 @@ document.getElementById('run-btn').addEventListener('click', async () => {
     const data = await res.json();
     if (!res.ok || data.error) { showError(data.error || 'Server error'); return; }
     currentJobId = data.job_id;
-    appendLog('Job started - ID: ' + currentJobId);
+    appendLog(`Job started — ID: ${currentJobId}`);
     pollStatus();
   } catch(err) {
     showError('Could not connect: ' + err.message);
   }
 });
 
+// Polling
 function pollStatus() {
   pollTimer = setInterval(async () => {
     try {
-      const res = await fetch('/api/status/' + currentJobId);
+      const res = await fetch(`/api/status/${currentJobId}`);
       const data = await res.json();
       const lines = data.progress || [];
       for (let i = lastLineCount; i < lines.length; i++) appendLog(lines[i]);
@@ -1051,7 +1087,7 @@ function pollStatus() {
         clearInterval(pollTimer);
         setPbar(100);
         document.getElementById('spinner').style.display = 'none';
-        document.getElementById('prog-title').textContent = 'Routes generated';
+        document.getElementById('prog-title').textContent = '✅ Routes generated';
         routeData = data.route_data;
         showDone(currentJobId, lines);
       } else if (data.status === 'error') {
@@ -1065,7 +1101,7 @@ function pollStatus() {
 
 function showDone(jobId, lines) {
   setRunning(false);
-  const dlUrl = '/api/download/' + jobId;
+  const dlUrl = `/api/download/${jobId}`;
   document.getElementById('dl-link').href = dlUrl;
   document.getElementById('dl-link-2').href = dlUrl;
   document.getElementById('action-bar').style.display = 'flex';
@@ -1093,6 +1129,7 @@ document.getElementById('view-results-btn').addEventListener('click', () => {
   document.getElementById('tab-results').classList.add('active');
 });
 
+// Build results tab
 function buildResultsTab(vehicles, jobId, initEditable=true) {
   document.getElementById('results-empty').style.display = 'none';
   document.getElementById('results-content').style.display = 'block';
@@ -1103,9 +1140,9 @@ function buildResultsTab(vehicles, jobId, initEditable=true) {
   const totalCap = vehicles.reduce((s, v) => s + v.capacity, 0);
   const campAddr = document.getElementById('camp-address').value.trim() || '828 Elbow Lane, Warrington, PA';
   const dirLabel = tripDirection === 'afternoon' ? 'All routes depart from' : 'All routes end at';
-  const tripLabel = tripDirection === 'afternoon' ? 'Afternoon run' : 'Morning run';
+  const tripLabel = tripDirection === 'afternoon' ? '🌇 Afternoon run' : '🌅 Morning run';
   document.getElementById('summary-hint').textContent =
-    tripLabel + ' - ' + totalRiders + ' riders - ' + totalCap + ' seats - ' + vehicles.length + ' vehicles - ' + dirLabel + ' ' + campAddr;
+    `${tripLabel} · ${totalRiders} riders · ${totalCap} seats · ${vehicles.length} vehicles · Kids ride time = first stop→camp · ${dirLabel} ${campAddr}`;
 
   const tbody = document.getElementById('summary-tbody');
   tbody.innerHTML = '';
@@ -1116,27 +1153,30 @@ function buildResultsTab(vehicles, jobId, initEditable=true) {
     const badgeCls = warn ? 'badge-warn' : 'badge-ok';
     const tr = document.createElement('tr');
     if (warn) tr.className = 'warn';
-    tr.innerHTML =
-      '<td><strong>' + v.name + '</strong></td>' +
-      '<td style="font-size:.75rem;color:#888;max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + (v.corridor || v.start_address) + '</td>' +
-      '<td><strong>' + v.rider_count + '</strong> / ' + v.capacity + '</td>' +
-      '<td><span class="util-bar-wrap"><span class="util-bar ' + barColor + '" style="width:' + pct + '%"></span></span><span class="badge ' + badgeCls + '">' + pct + '%' + (warn?' !':'') + '</span></td>' +
-      '<td>' + v.stop_count + '</td>' +
-      '<td>' + v.total_time + '</td>' +
-      '<td>' + v.total_distance + '</td>';
+    tr.innerHTML = `
+      <td><strong>${v.name}</strong></td>
+      <td style="font-size:.75rem;color:#888;max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${v.corridor || v.start_address}</td>
+      <td><strong>${v.rider_count}</strong> / ${v.capacity}</td>
+      <td>
+        <span class="util-bar-wrap"><span class="util-bar ${barColor}" style="width:${pct}%"></span></span>
+        <span class="badge ${badgeCls}">${pct}%${warn?' ⚠':''}</span>
+      </td>
+      <td>${v.stop_count}</td>
+      <td>${v.total_time}</td>
+      <td>${v.total_distance}</td>
+    `;
     tbody.appendChild(tr);
   });
 
   const totTr = document.createElement('tr');
   totTr.className = 'summary-totals';
-  const totalRidersAll = vehicles.reduce((s,v)=>s+v.rider_count,0);
-  const totalCapAll = vehicles.reduce((s,v)=>s+v.capacity,0);
-  totTr.innerHTML =
-    '<td colspan="2"><strong>TOTAL</strong></td>' +
-    '<td><strong>' + totalRidersAll + ' / ' + totalCapAll + '</strong></td>' +
-    '<td><strong>' + Math.round(totalRidersAll/totalCapAll*100) + '%</strong></td>' +
-    '<td><strong>' + vehicles.reduce((s,v)=>s+v.stop_count,0) + '</strong></td>' +
-    '<td>-</td><td>-</td>';
+  totTr.innerHTML = `
+    <td colspan="2"><strong>TOTAL</strong></td>
+    <td><strong>${totalRiders} / ${totalCap}</strong></td>
+    <td><strong>${Math.round(totalRiders/totalCap*100)}%</strong></td>
+    <td><strong>${vehicles.reduce((s,v)=>s+v.stop_count,0)}</strong></td>
+    <td>—</td><td>—</td>
+  `;
   tbody.appendChild(totTr);
 
   const unassignedTray = document.getElementById('unassigned-tray');
@@ -1151,50 +1191,65 @@ function buildResultsTab(vehicles, jobId, initEditable=true) {
   vehicles.forEach(v => {
     const card = document.createElement('div');
     card.className = 'veh-card' + (v.under_threshold ? ' warn-card' : '');
-    const mapId = 'map-' + v.name.replace(/\s+/g,'-');
+    const mapId = `map-${v.name.replace(/\s+/g,'-')}`;
     const campAddr = document.getElementById('camp-address').value.trim() || '828 Elbow Lane, Warrington, PA';
-
-    const stopsHtml = v.stops.map((s, si) => {
-      const addrParts = s.address.split(',');
-      const street = addrParts[0] || s.address;
-      const cityState = addrParts.slice(1).join(',').trim();
-      const riderPills = s.rider_names.split(', ')
-        .filter(r => r.trim())
-        .map(r => '<span class="rider-pill" data-rider="' + r + '" data-vehicle="' + v.name + '" data-address="' + s.address + '">' +
-          r + '<button class="rider-remove" title="Remove ' + r + '" onclick="removeRider(this, \'' + v.name + '\', ' + si + ', \'' + r + '\')">X</button></span>').join('');
-      return '<tr data-address="' + s.address + '" data-vehicle="' + v.name + '">' +
-        '<td class="stop-num">' + s.stop_num + '</td>' +
-        '<td class="stop-addr">' + street + '<div class="stop-city">' + cityState + '</div></td>' +
-        '<td class="stop-riders">' + riderPills + '<br><span class="stop-rider-count" style="font-size:.7rem;color:#aaa">' + s.rider_count + ' rider' + (s.rider_count!==1?'s':'') + '</span></td>' +
-        '<td class="stop-time">' + s.drive_time + '</td></tr>';
-    }).join('');
-
-    card.innerHTML =
-      '<div class="veh-header">' +
-      '<span class="veh-name">' + v.name + '</span>' +
-      '<span class="veh-corridor">' + (v.corridor || v.start_address) + '</span>' +
-      '<div class="veh-stats">' +
-      '<span class="veh-stat"><strong>' + v.rider_count + '</strong>/' + v.capacity + ' riders</span>' +
-      '<span class="veh-stat"><strong>' + v.utilization_pct + '%</strong></span>' +
-      '<span class="veh-stat">' + v.total_time + '</span>' +
-      '<span class="veh-stat">' + v.total_distance + '</span>' +
-      '</div>' +
-      '<span class="veh-chevron">v</span>' +
-      '</div>' +
-      '<div class="veh-body">' +
-      (v.under_threshold ? '<div style="background:#fff3cd;border:1px solid #f0c060;border-radius:6px;padding:.6rem .9rem;font-size:.78rem;color:#7a4f00;margin-bottom:.75rem">This vehicle is below 60% capacity.</div>' : '') +
-      '<div class="veh-map" id="' + mapId + '"><div class="map-loading">Loading map...</div></div>' +
-      '<div class="edit-bar">' +
-      '<button class="recalc-btn" id="recalc-' + v.name.replace(/\s+/g,'-') + '" onclick="recalculate()" disabled>Recalculate Routes</button>' +
-      '<span class="edit-hint">Click X on a rider to remove them from this route</span>' +
-      '</div>' +
-      '<table class="stop-table" id="stop-table-' + v.name.replace(/\s+/g,'-') + '">' +
-      '<thead><tr><th>#</th><th>Address</th><th>Riders</th><th>Drive Time</th></tr></thead>' +
-      '<tbody>' +
-      '<tr class="stop-row-start"><td class="stop-num">Start</td><td class="stop-addr" colspan="2">' + v.start_address + '<div class="stop-city">Departure point</div></td><td class="stop-time">-</td></tr>' +
-      stopsHtml +
-      '<tr class="stop-row-arrive"><td class="stop-num">End</td><td class="stop-addr" colspan="2">' + campAddr + '<div class="stop-city">Camp - destination</div></td><td class="stop-time">ARRIVE</td></tr>' +
-      '</tbody></table></div>';
+    card.innerHTML = `
+      <div class="veh-header">
+        <span class="veh-name">${v.name}</span>
+        <span class="veh-corridor">${v.corridor || v.start_address}</span>
+        <div class="veh-stats">
+          <span class="veh-stat"><strong>${v.rider_count}</strong>/${v.capacity} riders</span>
+          <span class="veh-stat"><strong>${v.utilization_pct}%</strong></span>
+          <span class="veh-stat">${v.total_time}</span>
+          <span class="veh-stat">${v.total_distance}</span>
+        </div>
+        <span class="veh-chevron">▼</span>
+      </div>
+      <div class="veh-body">
+        ${v.under_threshold ? `<div style="background:#fff3cd;border:1px solid #f0c060;border-radius:6px;padding:.6rem .9rem;font-size:.78rem;color:#7a4f00;margin-bottom:.75rem">⚠ This vehicle is below 60% capacity — it serves a geographically isolated area that cannot be merged without splitting neighbour groups.</div>` : ''}
+        <div class="veh-map" id="${mapId}">
+          <div class="map-loading">⏳ Loading map…</div>
+        </div>
+        <div class="edit-bar">
+          <button class="recalc-btn" id="recalc-${v.name.replace(/\s+/g,'-')}" onclick="recalculate()" disabled>
+            ↻ Recalculate Routes
+          </button>
+          <span class="edit-hint">Click ✕ on a rider to remove them from this route</span>
+        </div>
+        <table class="stop-table" id="stop-table-${v.name.replace(/\s+/g,'-')}">
+          <thead><tr><th>#</th><th>Address</th><th>Riders</th><th>Drive Time</th></tr></thead>
+          <tbody>
+            <tr class="stop-row-start">
+              <td class="stop-num">▶</td>
+              <td class="stop-addr" colspan="2">${v.start_address}<div class="stop-city">Departure point</div></td>
+              <td class="stop-time">—</td>
+            </tr>
+            ${v.stops.map((s, si) => {
+              const addrParts = s.address.split(',');
+              const street = addrParts[0] || s.address;
+              const cityState = addrParts.slice(1).join(',').trim();
+              const riderPills = s.rider_names.split(', ')
+                .filter(r => r.trim())
+                .map(r => `<span class="rider-pill" data-rider="${r}" data-vehicle="${v.name}" data-address="${s.address}">
+                  ${r}
+                  <button class="rider-remove" title="Remove ${r}" onclick="removeRider(this, '${v.name}', ${si}, '${r}')">✕</button>
+                </span>`).join('');
+              return `<tr data-address="${s.address}" data-vehicle="${v.name}">
+                <td class="stop-num">${s.stop_num}</td>
+                <td class="stop-addr">${street}<div class="stop-city">${cityState}</div></td>
+                <td class="stop-riders">${riderPills}<br><span class="stop-rider-count" style="font-size:.7rem;color:#aaa">${s.rider_count} rider${s.rider_count!==1?'s':''}</span></td>
+                <td class="stop-time">${s.drive_time}</td>
+              </tr>`;
+            }).join('')}
+            <tr class="stop-row-arrive">
+              <td class="stop-num">⛳</td>
+              <td class="stop-addr" colspan="2">${campAddr}<div class="stop-city">Camp — destination</div></td>
+              <td class="stop-time">${v.last_leg_mins ? v.last_leg_mins + ' min →' : '→'} ARRIVE</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    `;
 
     let mapInitialised = false;
     card.querySelector('.veh-header').addEventListener('click', () => {
@@ -1208,6 +1263,7 @@ function buildResultsTab(vehicles, jobId, initEditable=true) {
   });
 }
 
+// Vehicle map
 const initializedMaps = {};
 let googleMapsLoaded = false;
 let googleMapsLoading = false;
@@ -1217,7 +1273,7 @@ function loadGoogleMapsAPI() {
   if (googleMapsLoaded || googleMapsLoading) return;
   googleMapsLoading = true;
   const script = document.createElement('script');
-  script.src = 'https://maps.googleapis.com/maps/api/js?key=' + window.GOOGLE_MAPS_KEY + '&libraries=geometry,marker&callback=onGoogleMapsLoaded&v=beta';
+  script.src = `https://maps.googleapis.com/maps/api/js?key=${window.GOOGLE_MAPS_KEY}&libraries=geometry,marker&callback=onGoogleMapsLoaded&v=beta`;
   script.async = true;
   document.head.appendChild(script);
 }
@@ -1240,6 +1296,8 @@ function initVehicleMap(mapId, vehicle) {
     const lng = parseFloat(s.lon);
     if (!isNaN(lat) && !isNaN(lng) && Math.abs(lat) > 0.001 && Math.abs(lng) > 0.001) {
       allPoints.push({lat, lng, label: String(i+1), type: 'stop', riders: s.rider_names, address: s.address.split(',')[0]});
+    } else {
+      console.warn(`Stop ${i+1} missing coords: ${s.address} lat=${s.lat} lon=${s.lon}`);
     }
   });
 
@@ -1292,17 +1350,23 @@ async function renderGoogleMap(el, mapId, allPoints, vehicle, campAddr) {
       const size = pt.type === 'camp' ? 32 : 28;
       const bg = pt.type === 'camp' ? GREEN : GOLD;
       const fg = pt.type === 'camp' ? '#fff' : '#1a1018';
-      const lbl = pt.type === 'camp' ? 'Camp' : pt.label;
+      const lbl = pt.type === 'camp' ? '⛳' : pt.label;
       const pinEl = document.createElement('div');
-      pinEl.style.cssText = 'width:' + size + 'px;height:' + size + 'px;background:' + bg + ';border:2.5px solid #fff;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:' + (size<=28?'11':'13') + 'px;font-weight:700;color:' + fg + ';font-family:Arial;box-shadow:0 2px 8px rgba(0,0,0,.5);cursor:pointer';
+      pinEl.style.cssText = `width:${size}px;height:${size}px;background:${bg};border:2.5px solid #fff;` +
+        `border-radius:50%;display:flex;align-items:center;justify-content:center;` +
+        `font-size:${size<=28?'11':'13'}px;font-weight:700;color:${fg};font-family:Arial;` +
+        `box-shadow:0 2px 8px rgba(0,0,0,.5);cursor:pointer`;
       pinEl.textContent = lbl;
-      const popup = pt.type === 'camp' ? '<strong>Camp</strong><br>' + campAddr : '<strong>Stop ' + pt.label + '</strong><br>' + pt.address + '<br><em>' + pt.riders + '</em>';
+      const popup = pt.type === 'camp'
+        ? `<strong>Camp</strong><br>${campAddr}`
+        : `<strong>Stop ${pt.label}</strong><br>${pt.address}<br><em>${pt.riders}</em>`;
       const m = new AdvancedMarkerElement({position:{lat:pt.lat,lng:pt.lng}, map, content:pinEl, zIndex:200});
       m.addListener('click', () => { infoWindow.setContent(popup); infoWindow.open(map, m); });
     });
     map.fitBounds(bounds, {top:40, right:40, bottom:40, left:40});
   }
 
+  // Fetch road-following polyline from backend
   try {
     const resp = await fetch('/api/route-polyline', {
       method: 'POST',
@@ -1310,18 +1374,32 @@ async function renderGoogleMap(el, mapId, allPoints, vehicle, campAddr) {
       body: JSON.stringify({points: allPoints.map(p => ({lat: p.lat, lng: p.lng}))}),
     });
     const data = await resp.json();
+    if (data.errors && data.errors.length > 0) console.warn('Polyline notes:', data.errors);
     if (data.coords && data.coords.length > 1) {
-      new google.maps.Polyline({path: data.coords, map, strokeColor: BRAND, strokeWeight: 4, strokeOpacity: .85});
+      new google.maps.Polyline({
+        path: data.coords, map,
+        strokeColor: BRAND, strokeWeight: 4, strokeOpacity: .85,
+      });
     } else {
-      new google.maps.Polyline({path: allPoints.map(p => ({lat:p.lat, lng:p.lng})), map, strokeColor: BRAND, strokeWeight: 3, strokeOpacity: .6});
+      new google.maps.Polyline({
+        path: allPoints.map(p => ({lat:p.lat, lng:p.lng})), map,
+        strokeColor: BRAND, strokeWeight: 3, strokeOpacity: .6,
+        icons: [{icon:{path:'M 0,-1 0,1',strokeOpacity:1,scale:3},offset:'0',repeat:'10px'}],
+      });
     }
   } catch(e) {
-    new google.maps.Polyline({path: allPoints.map(p => ({lat:p.lat, lng:p.lng})), map, strokeColor: BRAND, strokeWeight: 3, strokeOpacity: .6});
+    console.warn('Route polyline failed:', e);
+    new google.maps.Polyline({
+      path: allPoints.map(p => ({lat:p.lat, lng:p.lng})), map,
+      strokeColor: BRAND, strokeWeight: 3, strokeOpacity: .6,
+      icons: [{icon:{path:'M 0,-1 0,1',strokeOpacity:1,scale:3},offset:'0',repeat:'10px'}],
+    });
   }
 
   drawMarkers();
 }
 
+// Manual editing
 let editableRoutes = null;
 let unassignedRiders = [];
 
@@ -1353,32 +1431,35 @@ function updateUnassignedTray() {
   const list = document.getElementById('unassigned-list');
   if (unassignedRiders.length === 0) { tray.classList.remove('visible'); return; }
   tray.classList.add('visible');
-  const vehOptions = (editableRoutes || []).map(v => '<option value="' + v.name + '">' + v.name + '</option>').join('');
-  list.innerHTML = unassignedRiders.map((r, i) =>
-    '<div class="unassigned-chip">' +
-    '<span>' + r.name + '</span>' +
-    '<span style="color:#aaa;font-size:.7rem">from ' + r.fromVehicle + '</span>' +
-    '<select id="assign-select-' + i + '"><option value="">Assign to...</option>' + vehOptions + '</select>' +
-    '<button class="reassign-btn" onclick="assignRider(' + i + ')">Move</button>' +
-    '</div>'
-  ).join('');
+  const vehOptions = (editableRoutes || []).map(v => `<option value="${v.name}">${v.name}</option>`).join('');
+  list.innerHTML = unassignedRiders.map((r, i) => `
+    <div class="unassigned-chip">
+      <span>${r.name}</span>
+      <span style="color:#aaa;font-size:.7rem">from ${r.fromVehicle}</span>
+      <select id="assign-select-${i}">
+        <option value="">Assign to...</option>
+        ${vehOptions}
+      </select>
+      <button class="reassign-btn" onclick="assignRider(${i})">Move</button>
+    </div>
+  `).join('');
 }
 
 function assignRider(idx) {
-  const select = document.getElementById('assign-select-' + idx);
+  const select = document.getElementById(`assign-select-${idx}`);
   const targetVehicleName = select.value;
   if (!targetVehicleName || !editableRoutes) return;
   const rider = unassignedRiders[idx];
   const targetVeh = editableRoutes.find(v => v.name === targetVehicleName);
   if (!targetVeh) return;
   const currentRiders = targetVeh.stops.reduce((s, st) => s + (st.rider_count || 1), 0);
-  if (currentRiders >= targetVeh.capacity) { alert(targetVehicleName + ' is already at full capacity (' + targetVeh.capacity + ' riders)'); return; }
+  if (currentRiders >= targetVeh.capacity) { alert(`${targetVehicleName} is already at full capacity (${targetVeh.capacity} riders)`); return; }
   const existingStop = targetVeh.stops.find(s => s.address === rider.stopAddress);
   if (existingStop) {
     existingStop.rider_names = existingStop.rider_names ? existingStop.rider_names + ', ' + rider.name : rider.name;
     existingStop.rider_count = (existingStop.rider_count || 0) + 1;
   } else {
-    targetVeh.stops.push({stop_num: targetVeh.stops.length + 1, address: rider.stopAddress, rider_names: rider.name, rider_count: 1, drive_time: '- recalculate', lat: rider.lat, lon: rider.lon});
+    targetVeh.stops.push({stop_num: targetVeh.stops.length + 1, address: rider.stopAddress, rider_names: rider.name, rider_count: 1, drive_time: '— recalculate', lat: rider.lat, lon: rider.lon});
   }
   unassignedRiders.splice(idx, 1);
   buildResultsTab(editableRoutes, currentJobId, false);
@@ -1390,9 +1471,9 @@ async function recalculate() {
   if (!editableRoutes || !currentJobId) return;
   const btn = document.getElementById('recalc-btn');
   btn.disabled = true;
-  btn.textContent = 'Recalculating...';
+  btn.textContent = 'Recalculating…';
   try {
-    const resp = await fetch('/api/recalculate/' + currentJobId, {
+    const resp = await fetch(`/api/recalculate/${currentJobId}`, {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({vehicles: editableRoutes}),
@@ -1405,7 +1486,10 @@ async function recalculate() {
     buildResultsTab(editableRoutes, currentJobId, false);
     updateUnassignedTray();
     document.getElementById('recalc-bar').classList.remove('visible');
-    document.getElementById('recalc-bar').innerHTML = '<span>Routes recalculated successfully</span><button class="recalc-btn" id="recalc-btn" onclick="recalculate()">Recalculate Again</button>';
+    document.getElementById('recalc-bar').innerHTML = `
+      <span>✅ Routes recalculated successfully</span>
+      <button class="recalc-btn" id="recalc-btn" onclick="recalculate()">Recalculate Again</button>
+    `;
     document.getElementById('recalc-bar').classList.add('visible');
     setTimeout(() => document.getElementById('recalc-bar').classList.remove('visible'), 3000);
     try {
@@ -1420,19 +1504,20 @@ async function recalculate() {
   }
 }
 
+// Helpers
 function setRunning(on) {
   const btn = document.getElementById('run-btn');
   btn.disabled = on;
-  document.getElementById('run-icon').textContent = on ? 'Loading' : 'Map';
-  document.getElementById('run-label').textContent = on ? 'Generating...' : 'Generate Route Plan';
+  document.getElementById('run-icon').textContent = on ? '⏳' : '🗺️';
+  document.getElementById('run-label').textContent = on ? 'Generating…' : 'Generate Route Plan';
   document.getElementById('spinner').style.display = on ? 'block' : 'none';
 }
 
 function appendLog(line) {
   const div = document.createElement('div');
-  if (line.includes('saved') || line.includes('Loaded')) div.className='ok';
-  else if (line.includes('warn')) div.className='warn';
-  else if (line.includes('Error')) div.className='err';
+  if (line.startsWith('✅')||line.startsWith('✓')||line.startsWith(' ✓')) div.className='ok';
+  else if (line.startsWith('⚠')||line.includes('Purged')||line.includes('warn')) div.className='warn';
+  else if (line.startsWith('❌')) div.className='err';
   div.textContent = line;
   const log = document.getElementById('log');
   log.appendChild(div);
@@ -1444,7 +1529,7 @@ function setPbar(pct) { document.getElementById('pbar').style.width = Math.min(1
 function estimatePct(lines) {
   if (!lines.length) return 5;
   const last = lines[lines.length-1]||'';
-  if (last.includes('Saved')||last.includes('saved')) return 100;
+  if (last.includes('Saved')||last.includes('✅')) return 100;
   if (last.includes('Sequence')||last.includes('stop')) return 85;
   if (last.includes('Active')) return 75;
   if (last.includes('Formed')||last.includes('cluster')) return 50;
@@ -1471,8 +1556,10 @@ async function clearCache() {
   }
 }
 
+// Init
 renderFleet();
 
+// Load previous results from localStorage
 try {
   const saved = localStorage.getItem('elbow_last_routes');
   if (saved) {
@@ -1495,4 +1582,4 @@ try {
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port, debug=True)
+    app.run(host="0.0.0.0", port=port, debug=False)
