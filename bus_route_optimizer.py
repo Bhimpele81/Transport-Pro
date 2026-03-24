@@ -799,8 +799,8 @@ def cluster_and_route(students: list, vehicles: list,
                 compatible.append((geo, vi))
             else:
                 fallback.append((geo, vi))
-        compatible.sort()
-        fallback.sort()
+        compatible.sort(key=lambda x: x[0] * (1 + counts[x[1]] / veh_objects[x[1]].capacity))
+        fallback.sort(key=lambda x: x[0] * (1 + counts[x[1]] / veh_objects[x[1]].capacity))
         if compatible:
             return compatible[0][1]
         if fallback:
