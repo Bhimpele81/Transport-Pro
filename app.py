@@ -1617,34 +1617,33 @@ async function clearCache() {
   }
 }
 
-// Saved addresses autocomplete
+// Saved addresses autocomplete (stored in browser localStorage)
+const ADDR_STORAGE_KEY = 'elbow_saved_addresses';
 let savedAddresses = [];
 
-async function loadSavedAddresses() {
+function loadSavedAddresses() {
   try {
-    const res = await fetch('/api/saved-addresses');
-    savedAddresses = await res.json();
-    const dl = document.getElementById('addr-suggestions');
-    dl.innerHTML = savedAddresses
-      .map(a => `<option value="${a.replace(/"/g, '&quot;')}">${a.replace(/</g, '&lt;')}</option>`)
-      .join('');
-  } catch(e) { /* non-critical */ }
+    savedAddresses = JSON.parse(localStorage.getItem(ADDR_STORAGE_KEY) || '[]');
+  } catch(e) { savedAddresses = []; }
+  const dl = document.getElementById('addr-suggestions');
+  dl.innerHTML = savedAddresses
+    .map(a => `<option value="${a.replace(/"/g, '&quot;')}">${a.replace(/</g, '&lt;')}</option>`)
+    .join('');
 }
 
-async function saveFleetAddresses() {
+function saveFleetAddresses() {
   const addrs = fleet.map(v => v.address.trim()).filter(a => a.length > 5);
+  let changed = false;
   for (const addr of addrs) {
     if (!savedAddresses.includes(addr)) {
-      try {
-        await fetch('/api/saved-addresses', {
-          method: 'POST',
-          headers: {'Content-Type': 'application/json'},
-          body: JSON.stringify({address: addr})
-        });
-      } catch(e) { /* non-critical */ }
+      savedAddresses.push(addr);
+      changed = true;
     }
   }
-  await loadSavedAddresses();
+  if (changed) {
+    localStorage.setItem(ADDR_STORAGE_KEY, JSON.stringify(savedAddresses));
+    loadSavedAddresses();
+  }
 }
 
 // Init

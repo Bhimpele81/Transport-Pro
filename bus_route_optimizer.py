@@ -812,12 +812,21 @@ def cluster_and_route(students: list, vehicles: list,
 
     for cl in assignable:
         sz = cl_size(cl)
-        vi = _best_vehicle(cl, sz)
         cl_b = _cl_bearing(cl)
-        for u in cl:
-            assignments[vi].append(u)
-        counts[vi] += sz
-        veh_bearings[vi].append(cl_b)
+        if any(veh_objects[vi].capacity - counts[vi] >= sz for vi in range(len(veh_objects))):
+            vi = _best_vehicle(cl, sz)
+            for u in cl:
+                assignments[vi].append(u)
+            counts[vi] += sz
+            veh_bearings[vi].append(cl_b)
+        else:
+            # No single bus fits the whole cluster — assign family units individually
+            for u in sorted(cl, key=lambda u: len(u), reverse=True):
+                unit_sz = len(u)
+                vi = _best_vehicle([u], unit_sz)
+                assignments[vi].append(u)
+                counts[vi] += unit_sz
+                veh_bearings[vi].append(_cl_bearing([u]))
 
     # -- 5b. Consolidation (disabled: all defined vehicles are kept) ----------
     changed, passes = False, 0
