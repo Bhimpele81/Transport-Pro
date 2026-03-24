@@ -799,8 +799,19 @@ def cluster_and_route(students: list, vehicles: list,
                 compatible.append((geo, vi))
             else:
                 fallback.append((geo, vi))
-        compatible.sort(key=lambda x: x[0] * (1 + counts[x[1]] / veh_objects[x[1]].capacity))
-        fallback.sort(key=lambda x: x[0] * (1 + counts[x[1]] / veh_objects[x[1]].capacity))
+        def _score(x, bearing_ref):
+            geo = x[0]
+            util = 1 + counts[x[1]] / veh_objects[x[1]].capacity
+            if veh_bearings[x[1]]:
+                avg_b = sum(veh_bearings[x[1]]) / len(veh_bearings[x[1]])
+                bearing_diff = min(abs(avg_b - bearing_ref), 360 - abs(avg_b - bearing_ref))
+                bearing_penalty = 1 + bearing_diff / 180.0
+            else:
+                bearing_penalty = 1.0
+            return geo * util * bearing_penalty
+
+        compatible.sort(key=lambda x: _score(x, cl_b))
+        fallback.sort(key=lambda x: _score(x, cl_b))
         if compatible:
             return compatible[0][1]
         if fallback:
@@ -994,13 +1005,14 @@ def cluster_and_route(students: list, vehicles: list,
         # legs[-1] = stopN->camp
         legs = route_leg_times(coord_seq, progress_cb)
 
-        # Stop 1: blank, stop 2+: stop-to-stop time
+        # Each stop shows remaining ride time to camp from that pickup
         for i, stop in enumerate(sorted_stops):
-            if i == 0:
-                stop.drive_time = ""
+            remaining = round(sum(legs[i + 1:]))
+            if remaining >= 60:
+                hrs, rem = divmod(remaining, 60)
+                stop.drive_time = f"{hrs}h {rem}m to camp" if rem else f"{hrs}h to camp"
             else:
-                mins = max(1, round(legs[i]))
-                stop.drive_time = f"{mins} min"
+                stop.drive_time = f"{remaining} min to camp" if remaining > 0 else "< 1 min to camp"
 
         # Store last leg (stopN -> camp) for arrival row display
         veh.last_leg_mins = max(1, round(legs[-1])) if legs else 0

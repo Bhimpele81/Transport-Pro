@@ -1367,7 +1367,7 @@ function initVehicleMap(mapId, vehicle) {
   allPoints.push({lat: campLat, lng: campLng, type: 'camp'});
 
   if (allPoints.length < 2) {
-    el.innerHTML = '<div class="map-loading">No coordinates available</div>';
+    el.innerHTML = '<div class="map-loading" style="color:#c0392b;font-size:.85rem;padding:1rem">⚠️ Map unavailable — one or more stops could not be geocoded.<br>Check addresses or add a coordinate override.</div>';
     return;
   }
 
