@@ -815,104 +815,91 @@ def cluster_and_route(students: list, vehicles: list,
                 chunk.append(u); chunk_n += len(u)
             if chunk: assignable.append(chunk)
 
-    # Sort by compass sector first (45° buckets), then farthest-first within
-    # each sector.  This ensures each vehicle builds a clean directional
-    # corridor: all NW clusters are processed together before N, then NE, etc.
-    # Previously, pure distance sorting interleaved opposite-direction clusters
-    # onto the same bus (e.g. Montgomeryville W + Castle Valley NE → Vehicle E).
-    def _bear(cl):
-        clat, clon = centroid(cl)
-        return bearing_deg(camp_lat, camp_lon, clat, clon)
+    # ── Phase 1: Compass-sector pre-assignment ──────────────────────────────
+    # Methodology (works for any camp location, fleet size, student distribution):
+    #
+    #  1. Tag every cluster with its bearing from camp (0° = N, clockwise).
+    #  2. Find the largest angular gap between consecutive cluster bearings —
+    #     that gap is the "emptiest" compass direction and becomes the natural
+    #     sector boundary so we never cut across a dense neighbourhood.
+    #  3. Rotate the bearing-sorted cluster list to start just after that gap.
+    #  4. Order vehicles so the one whose garage is closest to the first cluster
+    #     goes first; remaining vehicles follow in garage-proximity order.
+    #     (When all buses share the same depot this degenerates to capacity order,
+    #     which is fine — larger buses fill first and smaller ones get the tail.)
+    #  5. Sweep through clusters in bearing order, assigning to the current
+    #     vehicle until it is full, then advance to the next vehicle.
+    #
+    # This guarantees every vehicle receives a *contiguous compass arc*, so
+    # routes can never criss-cross or double back through camp — regardless of
+    # the number of vehicles or where the students live.
+    # ────────────────────────────────────────────────────────────────────────
 
-    assignable.sort(
-        key=lambda cl: (
-            int(_bear(cl) / 45),                               # 45° sector (0-7)
-            -haversine_mi(*centroid(cl), camp_lat, camp_lon),  # farthest first
+    # Step 1 — tag clusters with bearing and distance from camp
+    cl_tagged = []
+    for cl in assignable:
+        clat, clon = centroid(cl)
+        b = bearing_deg(camp_lat, camp_lon, clat, clon)
+        d = haversine_mi(clat, clon, camp_lat, camp_lon)
+        cl_tagged.append((b, d, cl))
+    cl_tagged.sort(key=lambda x: x[0])   # sort by bearing 0-360
+
+    # Step 2 — find the largest angular gap between consecutive bearings
+    if len(cl_tagged) >= 2:
+        best_gap, best_start = -1.0, 0
+        for i in range(len(cl_tagged)):
+            nxt_b = cl_tagged[(i + 1) % len(cl_tagged)][0]
+            cur_b = cl_tagged[i][0]
+            gap = (nxt_b - cur_b) % 360
+            if gap > best_gap:
+                best_gap, best_start = gap, (i + 1) % len(cl_tagged)
+        cl_tagged = cl_tagged[best_start:] + cl_tagged[:best_start]
+
+    # Step 3 — order vehicles by garage proximity to first cluster
+    if cl_tagged:
+        first_lat, first_lon = centroid(cl_tagged[0][2])
+    else:
+        first_lat, first_lon = camp_lat, camp_lon
+    v_order = sorted(
+        range(len(veh_objects)),
+        key=lambda i: (
+            haversine_mi(first_lat, first_lon,
+                         veh_objects[i].start_lat, veh_objects[i].start_lon),
+            -veh_objects[i].capacity,   # tiebreak: larger bus first
         )
     )
 
-    assignments = [[] for _ in veh_objects]
-    counts = [0] * len(veh_objects)
-    veh_bearings = [[] for _ in veh_objects]
+    assignments   = [[] for _ in veh_objects]
+    counts        = [0]  * len(veh_objects)
+    veh_bearings  = [[] for _ in veh_objects]
 
-    def _cl_bearing(cl):
-        clat, clon = centroid(cl)
-        return bearing_deg(camp_lat, camp_lon, clat, clon)
-
-    def _best_vehicle(cl, sz):
-        cl_b = _cl_bearing(cl)
-        clat, clon = centroid(cl)
-        compatible = []
-        fallback = []
-        for vi in range(len(veh_objects)):
-            if veh_objects[vi].capacity - counts[vi] < sz:
-                continue
-            geo = haversine_mi(clat, clon,
-                               veh_objects[vi].start_lat,
-                               veh_objects[vi].start_lon)
-            if _bearing_compatible(veh_bearings[vi], cl_b):
-                compatible.append((geo, vi))
-            elif _bearing_spread(veh_bearings[vi] + [cl_b]) <= HARD_MAX_BEARING_SPREAD_DEG:
-                # Allow as fallback only if spread stays within hard ceiling
-                fallback.append((geo, vi))
-            # else: spread would be > HARD_MAX — completely excluded (would create
-            #        a camp-crossing back-and-forth route)
-        def _score(x, bearing_ref):
-            geo = x[0]
-            util = 1 + counts[x[1]] / veh_objects[x[1]].capacity
-            if veh_bearings[x[1]]:
-                # Vehicle has an established corridor — apply a strong quadratic
-                # penalty for deviating from it.  At 75° off it costs ~4×, at
-                # 90° it costs ~7×, making an established corridor very sticky
-                # and preventing vehicles from "stealing" clusters in a
-                # different geographic area just because they happen to be closer.
-                avg_b = sum(veh_bearings[x[1]]) / len(veh_bearings[x[1]])
-                bearing_diff = min(abs(avg_b - bearing_ref),
-                                   360 - abs(avg_b - bearing_ref))
-                bearing_penalty = (1 + bearing_diff / 45.0) ** 2
-            else:
-                # Empty vehicle: compete purely on garage→cluster distance so
-                # buses anchor to their home neighbourhood first.
-                bearing_penalty = 1.0
-            return geo * util * bearing_penalty
-
-        compatible.sort(key=lambda x: _score(x, cl_b))
-        fallback.sort(key=lambda x: _score(x, cl_b))
-        if compatible:
-            return compatible[0][1]
-        if fallback:
-            return fallback[0][1]
-        fits = [i for i in range(len(veh_objects)) if veh_objects[i].capacity - counts[i] >= sz]
-        if fits:
-            # Still respect bearing as much as possible — pick the vehicle whose
-            # resulting spread is smallest (best direction match), breaking ties
-            # by least loaded.  This prevents Lansdale-W + Jamison-E or
-            # Horsham-S + Chalfont-N from landing on the same bus just because
-            # it happens to have the most seats left.
-            def _fits_score(i):
-                spread = _bearing_spread(veh_bearings[i] + [cl_b]) if veh_bearings[i] else 0.0
-                util   = counts[i] / veh_objects[i].capacity if veh_objects[i].capacity else 0.0
-                return (spread, util)
-            return min(fits, key=_fits_score)
-        return max(range(len(veh_objects)), key=lambda i: veh_objects[i].capacity - counts[i])
-
-    for cl in assignable:
+    # Step 4 — sweep: fill each vehicle to capacity, then advance
+    vi_ptr = 0   # index into v_order
+    for b, d, cl in cl_tagged:
         sz = cl_size(cl)
-        cl_b = _cl_bearing(cl)
-        if any(veh_objects[vi].capacity - counts[vi] >= sz for vi in range(len(veh_objects))):
-            vi = _best_vehicle(cl, sz)
+        # Advance to the next vehicle if the current one cannot fit this cluster
+        while (vi_ptr < len(v_order) - 1 and
+               veh_objects[v_order[vi_ptr]].capacity - counts[v_order[vi_ptr]] < sz):
+            vi_ptr += 1
+        vi = v_order[vi_ptr]
+
+        if veh_objects[vi].capacity - counts[vi] >= sz:
+            # Whole cluster fits — assign it
             for u in cl:
                 assignments[vi].append(u)
             counts[vi] += sz
-            veh_bearings[vi].append(cl_b)
+            veh_bearings[vi].append(b)
         else:
-            # No single bus fits the whole cluster — assign family units individually
+            # True overflow: total students exceed total fleet capacity.
+            # Assign family units one-by-one to whatever space remains,
+            # preferring the vehicle with the most remaining seats.
             for u in sorted(cl, key=lambda u: len(u), reverse=True):
                 unit_sz = len(u)
-                vi = _best_vehicle([u], unit_sz)
-                assignments[vi].append(u)
-                counts[vi] += unit_sz
-                veh_bearings[vi].append(_cl_bearing([u]))
+                best_vi = max(range(len(veh_objects)),
+                              key=lambda i: veh_objects[i].capacity - counts[i])
+                assignments[best_vi].append(u)
+                counts[best_vi] += unit_sz
+                veh_bearings[best_vi].append(b)
 
     # -- 5b. Consolidation (disabled: all defined vehicles are kept) ----------
     changed, passes = False, 0
