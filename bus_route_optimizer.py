@@ -45,6 +45,13 @@ HARD_MAX_BEARING_SPREAD_DEG = 85.0
 CAMP_CROSS_PENALTY = 3.0
 CAMP_CROSS_RADIUS_MI = 1.5   # within this distance of camp counts as "crossing"
 
+# Penalty per mile for any stop→stop leg that moves the bus FARTHER from camp.
+# This forces farthest-first sequencing at the route level and prevents the
+# optimizer from choosing a shorter haversine path that creates a visual V-shape
+# (e.g. Colmar→Lansdale/NW then back SW to Spring House).
+# Does NOT apply to the initial garage→first-stop deadhead leg.
+BACKTRACK_PENALTY = 0.7
+
 # Distance tier width for sequencing - stops within this range of each other
 # in distance-from-camp are grouped and sorted by nearest-neighbor
 TIER_WIDTH_MI = 1.0
@@ -672,17 +679,27 @@ def _sequence_stops_camp_directional(stops: list, camp_lat: float, camp_lon: flo
     r_lat = garage_lat if garage_lat is not None else result[0].lat
     r_lon = garage_lon if garage_lon is not None else result[0].lon
 
-    def _leg_cost(lat1, lon1, lat2, lon2, is_final_leg):
-        """Haversine distance plus a penalty if this leg passes near camp mid-route."""
+    def _leg_cost(lat1, lon1, lat2, lon2, is_final_leg, is_first_leg=False):
+        """Haversine distance plus penalties for camp-crossing or backtracking away from camp."""
         d = haversine_mi(lat1, lon1, lat2, lon2)
         if is_final_leg:
-            return d  # the last leg TO camp is always fine
+            return d  # last leg TO camp is always fine
         # Penalise legs whose midpoint is close to camp (bus passing through camp)
         mid_lat = (lat1 + lat2) / 2
         mid_lon = (lon1 + lon2) / 2
         camp_d = haversine_mi(mid_lat, mid_lon, camp_lat, camp_lon)
         if camp_d < CAMP_CROSS_RADIUS_MI:
             d += CAMP_CROSS_PENALTY * (CAMP_CROSS_RADIUS_MI - camp_d)
+        # Backtrack penalty: stop→stop legs that move the bus farther from camp.
+        # Skipped for the initial garage→first-stop deadhead (is_first_leg=True).
+        # This forces farthest-first sequencing and prevents V-shape routes like
+        # Colmar(11mi)→Lansdale(14.6mi)→Spring House where the bus swings away
+        # from camp after already being far out.
+        if not is_first_leg:
+            d2c_start = haversine_mi(lat1, lon1, camp_lat, camp_lon)
+            d2c_end   = haversine_mi(lat2, lon2, camp_lat, camp_lon)
+            if d2c_end > d2c_start + 0.5:   # more than 0.5 mi farther from camp
+                d += BACKTRACK_PENALTY * (d2c_end - d2c_start)
         return d
 
     def _route_dist(seq):
@@ -692,7 +709,8 @@ def _sequence_stops_camp_directional(stops: list, camp_lat: float, camp_lon: flo
         n = len(pts)
         return sum(
             _leg_cost(pts[i][0], pts[i][1], pts[i+1][0], pts[i+1][1],
-                      is_final_leg=(i == n - 2))
+                      is_final_leg=(i == n - 2),
+                      is_first_leg=(i == 0))
             for i in range(n - 1)
         )
 
