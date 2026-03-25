@@ -908,33 +908,108 @@ def cluster_and_route(students: list, vehicles: list,
     counts        = [0]  * len(veh_objects)
     veh_bearings  = [[] for _ in veh_objects]
 
-    # Step 4 — sweep: fill each vehicle to capacity, then advance
-    vi_ptr = 0   # index into v_order
+    def _assign(vi, cl, b):
+        for u in cl:
+            assignments[vi].append(u)
+        counts[vi] += cl_size(cl)
+        veh_bearings[vi].append(b)
+
+    def _overflow_assign(cl, b):
+        """Last-resort: assign family units one-by-one to most-available vehicle."""
+        for u in sorted(cl, key=lambda u: len(u), reverse=True):
+            best_vi = max(range(len(veh_objects)),
+                          key=lambda i: veh_objects[i].capacity - counts[i])
+            assignments[best_vi].append(u)
+            counts[best_vi] += len(u)
+            veh_bearings[best_vi].append(b)
+
+    # ── Pass 1: away-garage vehicles (fill each sequentially) ────────────────
+    # Each away vehicle is already bearing-matched to its home corridor.
+    # Fill them in order; any cluster that won't fit rolls over to Pass 2.
+    away_ptr = 0
+    leftover = []
     for b, d, cl in cl_tagged:
         sz = cl_size(cl)
-        # Advance to the next vehicle if the current one cannot fit this cluster
-        while (vi_ptr < len(v_order) - 1 and
-               veh_objects[v_order[vi_ptr]].capacity - counts[v_order[vi_ptr]] < sz):
-            vi_ptr += 1
-        vi = v_order[vi_ptr]
+        placed = False
+        while away_ptr < len(away):
+            vi = away[away_ptr]
+            if counts[vi] + sz <= veh_objects[vi].capacity:
+                _assign(vi, cl, b)
+                placed = True
+                break
+            away_ptr += 1
+        if not placed:
+            leftover.append((b, d, cl))
 
-        if veh_objects[vi].capacity - counts[vi] >= sz:
-            # Whole cluster fits — assign it
-            for u in cl:
-                assignments[vi].append(u)
-            counts[vi] += sz
-            veh_bearings[vi].append(b)
+    # ── Pass 2: local (camp-garage) vehicles — equal angular sectors ─────────
+    # Re-rotate the leftover clusters to find THEIR natural sector boundary
+    # (independent of the global rotation used for away vehicles).  Then
+    # divide the remaining arc into equal-width sectors — one per local
+    # vehicle — so each bus serves a distinct compass wedge.
+    #
+    # This prevents the "fill-then-advance" artefact where both local
+    # vehicles end up serving the same mix of Ambler + Lansdale + Chalfont.
+    if leftover and local:
+        left_sorted = sorted(leftover, key=lambda x: x[0])
+        if len(left_sorted) >= 2:
+            best_gap, best_start = -1.0, 0
+            for i in range(len(left_sorted)):
+                nxt_b = left_sorted[(i + 1) % len(left_sorted)][0]
+                cur_b = left_sorted[i][0]
+                gap   = (nxt_b - cur_b) % 360
+                if gap > best_gap:
+                    best_gap, best_start = gap, (i + 1) % len(left_sorted)
+            left_sorted = left_sorted[best_start:] + left_sorted[:best_start]
+
+        n_local = len(local)
+        if n_local == 1:
+            for b, d, cl in left_sorted:
+                sz = cl_size(cl)
+                vi = local[0]
+                if counts[vi] + sz <= veh_objects[vi].capacity:
+                    _assign(vi, cl, b)
+                else:
+                    _overflow_assign(cl, b)
         else:
-            # True overflow: total students exceed total fleet capacity.
-            # Assign family units one-by-one to whatever space remains,
-            # preferring the vehicle with the most remaining seats.
-            for u in sorted(cl, key=lambda u: len(u), reverse=True):
-                unit_sz = len(u)
-                best_vi = max(range(len(veh_objects)),
-                              key=lambda i: veh_objects[i].capacity - counts[i])
-                assignments[best_vi].append(u)
-                counts[best_vi] += unit_sz
-                veh_bearings[best_vi].append(b)
+            # Divide the remaining bearing arc proportionally by capacity
+            total_local_cap = sum(veh_objects[i].capacity for i in local)
+            arc_start = left_sorted[0][0]
+            arc_end   = left_sorted[-1][0]
+            arc_width = (arc_end - arc_start) % 360 + 0.001
+
+            cum_frac = 0.0
+            sector_bounds = []          # upper bearing boundary for each local vehicle
+            for li in range(n_local - 1):
+                cum_frac += veh_objects[local[li]].capacity / total_local_cap
+                sector_bounds.append(arc_start + cum_frac * arc_width)
+
+            for b, d, cl in left_sorted:
+                sz  = cl_size(cl)
+                pos = (b - arc_start) % 360
+                li  = 0
+                for bound in sector_bounds:
+                    if pos < (bound - arc_start) % 360:
+                        break
+                    li += 1
+                li = min(li, n_local - 1)
+                vi = local[li]
+
+                if counts[vi] + sz <= veh_objects[vi].capacity:
+                    _assign(vi, cl, b)
+                else:
+                    # Sector is full — try other local vehicles, then overflow
+                    placed = False
+                    for alt_vi in local:
+                        if counts[alt_vi] + sz <= veh_objects[alt_vi].capacity:
+                            _assign(alt_vi, cl, b)
+                            placed = True
+                            break
+                    if not placed:
+                        _overflow_assign(cl, b)
+    elif leftover:
+        # No local vehicles defined — overflow assign everything remaining
+        for b, d, cl in leftover:
+            _overflow_assign(cl, b)
 
     # -- 5b. Consolidation (disabled: all defined vehicles are kept) ----------
     changed, passes = False, 0
