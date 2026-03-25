@@ -884,7 +884,16 @@ def cluster_and_route(students: list, vehicles: list,
             return fallback[0][1]
         fits = [i for i in range(len(veh_objects)) if veh_objects[i].capacity - counts[i] >= sz]
         if fits:
-            return min(fits, key=lambda i: counts[i])
+            # Still respect bearing as much as possible — pick the vehicle whose
+            # resulting spread is smallest (best direction match), breaking ties
+            # by least loaded.  This prevents Lansdale-W + Jamison-E or
+            # Horsham-S + Chalfont-N from landing on the same bus just because
+            # it happens to have the most seats left.
+            def _fits_score(i):
+                spread = _bearing_spread(veh_bearings[i] + [cl_b]) if veh_bearings[i] else 0.0
+                util   = counts[i] / veh_objects[i].capacity if veh_objects[i].capacity else 0.0
+                return (spread, util)
+            return min(fits, key=_fits_score)
         return max(range(len(veh_objects)), key=lambda i: veh_objects[i].capacity - counts[i])
 
     for cl in assignable:
