@@ -636,42 +636,36 @@ def _sequence_stops_camp_directional(stops: list, camp_lat: float, camp_lon: flo
     def d2c(s):
         return haversine_mi(s.lat, s.lon, camp_lat, camp_lon)
 
-    if trip_direction == "afternoon":
-        sorted_stops = sorted(stops, key=d2c)
-    else:
-        sorted_stops = sorted(stops, key=d2c, reverse=True)
+    # Distance-biased nearest-neighbor — no artificial tiers.
+    #
+    # Morning: score = dist_to_stop − 1.5 × d2c(stop)
+    #   Stops far from camp get a lower score → visited first (farthest-first
+    #   sweep without rigid tier boundaries that cause V-shape backtracks).
+    #
+    # Afternoon: pure nearest-neighbor (no bias needed; drop nearby kids first).
+    #
+    # After the initial NN pass, 2-opt + or-opt remove any remaining crossovers.
 
-    # Group into distance tiers
-    tiers = []
-    current_tier = [sorted_stops[0]]
-    ref_d = d2c(sorted_stops[0])
-
-    for s in sorted_stops[1:]:
-        if abs(d2c(s) - ref_d) <= TIER_WIDTH_MI:
-            current_tier.append(s)
-        else:
-            tiers.append(current_tier)
-            current_tier = [s]
-            ref_d = d2c(s)
-    tiers.append(current_tier)
-
-    # Start nearest-neighbor from garage if provided, else first tier centroid
     if garage_lat is not None and garage_lon is not None:
         last_lat, last_lon = garage_lat, garage_lon
     else:
-        last_lat = sum(s.lat for s in tiers[0]) / len(tiers[0])
-        last_lon = sum(s.lon for s in tiers[0]) / len(tiers[0])
+        last_lat = sum(s.lat for s in stops) / len(stops)
+        last_lon = sum(s.lon for s in stops) / len(stops)
 
-    # Within each tier, use nearest-neighbor
     result = []
-    for tier in tiers:
-        remaining = list(tier)
-        while remaining:
-            nearest = min(remaining,
-                key=lambda s: haversine_mi(last_lat, last_lon, s.lat, s.lon))
-            result.append(nearest)
-            last_lat, last_lon = nearest.lat, nearest.lon
-            remaining.remove(nearest)
+    remaining = list(stops)
+    while remaining:
+        if trip_direction == "morning":
+            # Lower score = closer to current position AND farther from camp
+            best = min(remaining,
+                       key=lambda s: (haversine_mi(last_lat, last_lon, s.lat, s.lon)
+                                      - 1.5 * d2c(s)))
+        else:
+            best = min(remaining,
+                       key=lambda s: haversine_mi(last_lat, last_lon, s.lat, s.lon))
+        result.append(best)
+        last_lat, last_lon = best.lat, best.lon
+        remaining.remove(best)
 
     # 2-opt improvement: iteratively swap pairs of edges to eliminate crossovers
     # Full route evaluated as: garage -> stops -> camp
