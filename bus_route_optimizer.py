@@ -38,6 +38,12 @@ MPH_SUBURBAN  = 30.0
 # Ambler is 217 deg (SW) from camp, Chalfont is 309 deg (NW) = 92 deg apart.
 # Setting this to 75 keeps directionally-incompatible stops off the same bus.
 MAX_BEARING_SPREAD_DEG = 75.0
+# Hard ceiling: a vehicle whose spread would exceed this is excluded from fallback
+# entirely — prevents north+south (or east+west) stops landing on the same bus.
+HARD_MAX_BEARING_SPREAD_DEG = 100.0
+# Penalty multiplier applied per mile when a route leg passes near camp mid-route
+CAMP_CROSS_PENALTY = 3.0
+CAMP_CROSS_RADIUS_MI = 1.5   # within this distance of camp counts as "crossing"
 
 # Distance tier width for sequencing - stops within this range of each other
 # in distance-from-camp are grouped and sorted by nearest-neighbor
@@ -672,13 +678,31 @@ def _sequence_stops_camp_directional(stops: list, camp_lat: float, camp_lon: flo
     r_lat = garage_lat if garage_lat is not None else result[0].lat
     r_lon = garage_lon if garage_lon is not None else result[0].lon
 
+    def _leg_cost(lat1, lon1, lat2, lon2, is_final_leg):
+        """Haversine distance plus a penalty if this leg passes near camp mid-route."""
+        d = haversine_mi(lat1, lon1, lat2, lon2)
+        if is_final_leg:
+            return d  # the last leg TO camp is always fine
+        # Penalise legs whose midpoint is close to camp (bus passing through camp)
+        mid_lat = (lat1 + lat2) / 2
+        mid_lon = (lon1 + lon2) / 2
+        camp_d = haversine_mi(mid_lat, mid_lon, camp_lat, camp_lon)
+        if camp_d < CAMP_CROSS_RADIUS_MI:
+            d += CAMP_CROSS_PENALTY * (CAMP_CROSS_RADIUS_MI - camp_d)
+        return d
+
     def _route_dist(seq):
         pts = ([(r_lat, r_lon)]
                + [(s.lat, s.lon) for s in seq]
                + [(camp_lat, camp_lon)])
-        return sum(haversine_mi(pts[i][0], pts[i][1], pts[i+1][0], pts[i+1][1])
-                   for i in range(len(pts) - 1))
+        n = len(pts)
+        return sum(
+            _leg_cost(pts[i][0], pts[i][1], pts[i+1][0], pts[i+1][1],
+                      is_final_leg=(i == n - 2))
+            for i in range(n - 1)
+        )
 
+    # 2-opt: reverse sub-segments to eliminate crossing edges
     improved = True
     while improved:
         improved = False
@@ -688,6 +712,25 @@ def _sequence_stops_camp_directional(stops: list, camp_lat: float, camp_lon: flo
                 if _route_dist(candidate) < _route_dist(result):
                     result = candidate
                     improved = True
+
+    # Or-opt: try relocating each single stop to every other position
+    improved = True
+    while improved:
+        improved = False
+        for i in range(len(result)):
+            for j in range(len(result) + 1):
+                if j in (i, i + 1):
+                    continue
+                stop = result[i]
+                candidate = result[:i] + result[i+1:]
+                insert_at = j if j < i else j - 1
+                candidate = candidate[:insert_at] + [stop] + candidate[insert_at:]
+                if _route_dist(candidate) < _route_dist(result) - 1e-9:
+                    result = candidate
+                    improved = True
+                    break
+            if improved:
+                break
 
     return result
 
@@ -797,8 +840,11 @@ def cluster_and_route(students: list, vehicles: list,
                                veh_objects[vi].start_lon)
             if _bearing_compatible(veh_bearings[vi], cl_b):
                 compatible.append((geo, vi))
-            else:
+            elif _bearing_spread(veh_bearings[vi] + [cl_b]) <= HARD_MAX_BEARING_SPREAD_DEG:
+                # Allow as fallback only if spread stays within hard ceiling
                 fallback.append((geo, vi))
+            # else: spread would be > HARD_MAX — completely excluded (would create
+            #        a camp-crossing back-and-forth route)
         def _score(x, bearing_ref):
             geo = x[0]
             util = 1 + counts[x[1]] / veh_objects[x[1]].capacity
