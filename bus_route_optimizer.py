@@ -50,7 +50,7 @@ CAMP_CROSS_RADIUS_MI = 1.5   # within this distance of camp counts as "crossing"
 # optimizer from choosing a shorter haversine path that creates a visual V-shape
 # (e.g. Colmar→Lansdale/NW then back SW to Spring House).
 # Does NOT apply to the initial garage→first-stop deadhead leg.
-BACKTRACK_PENALTY = 0.7
+BACKTRACK_PENALTY = 3.0
 
 # Distance tier width for sequencing - stops within this range of each other
 # in distance-from-camp are grouped and sorted by nearest-neighbor
@@ -643,36 +643,38 @@ def _sequence_stops_camp_directional(stops: list, camp_lat: float, camp_lon: flo
     def d2c(s):
         return haversine_mi(s.lat, s.lon, camp_lat, camp_lon)
 
-    # Distance-biased nearest-neighbor — no artificial tiers.
+    # Morning: sort farthest-from-camp first so near-camp students are always
+    # picked up last (shortest possible ride for those closest to camp).
+    # Pure d2c-descending is the only reliable guarantee — distance-biased NN
+    # fails when the garage happens to be near a close-to-camp stop (that stop
+    # then wins the first NN pick despite being near camp).
     #
-    # Morning: score = dist_to_stop − 1.5 × d2c(stop)
-    #   Stops far from camp get a lower score → visited first (farthest-first
-    #   sweep without rigid tier boundaries that cause V-shape backtracks).
+    # Afternoon: nearest-neighbor from camp (drop nearby riders first).
     #
-    # Afternoon: pure nearest-neighbor (no bias needed; drop nearby kids first).
-    #
-    # After the initial NN pass, 2-opt + or-opt remove any remaining crossovers.
+    # After the initial ordering, 2-opt + or-opt remove geographic crossovers.
+    # BACKTRACK_PENALTY is set high (3.0) so 2-opt cannot reverse the
+    # farthest-first order to save a few haversine miles.
 
     if garage_lat is not None and garage_lon is not None:
-        last_lat, last_lon = garage_lat, garage_lon
+        r_lat_init, r_lon_init = garage_lat, garage_lon
     else:
-        last_lat = sum(s.lat for s in stops) / len(stops)
-        last_lon = sum(s.lon for s in stops) / len(stops)
+        r_lat_init = sum(s.lat for s in stops) / len(stops)
+        r_lon_init = sum(s.lon for s in stops) / len(stops)
 
-    result = []
-    remaining = list(stops)
-    while remaining:
-        if trip_direction == "morning":
-            # Lower score = closer to current position AND farther from camp
-            best = min(remaining,
-                       key=lambda s: (haversine_mi(last_lat, last_lon, s.lat, s.lon)
-                                      - 1.5 * d2c(s)))
-        else:
+    if trip_direction == "morning":
+        # Farthest from camp first; ties broken by bearing to spread geographically
+        result = sorted(stops, key=lambda s: -d2c(s))
+    else:
+        # Afternoon: nearest-neighbor from camp (nearest drop-offs first)
+        result = []
+        remaining = list(stops)
+        last_lat, last_lon = camp_lat, camp_lon
+        while remaining:
             best = min(remaining,
                        key=lambda s: haversine_mi(last_lat, last_lon, s.lat, s.lon))
-        result.append(best)
-        last_lat, last_lon = best.lat, best.lon
-        remaining.remove(best)
+            result.append(best)
+            last_lat, last_lon = best.lat, best.lon
+            remaining.remove(best)
 
     # 2-opt improvement: iteratively swap pairs of edges to eliminate crossovers
     # Full route evaluated as: garage -> stops -> camp
