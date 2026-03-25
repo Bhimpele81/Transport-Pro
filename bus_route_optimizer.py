@@ -40,7 +40,7 @@ MPH_SUBURBAN  = 30.0
 MAX_BEARING_SPREAD_DEG = 75.0
 # Hard ceiling: a vehicle whose spread would exceed this is excluded from fallback
 # entirely — prevents north+south (or east+west) stops landing on the same bus.
-HARD_MAX_BEARING_SPREAD_DEG = 100.0
+HARD_MAX_BEARING_SPREAD_DEG = 85.0
 # Penalty multiplier applied per mile when a route leg passes near camp mid-route
 CAMP_CROSS_PENALTY = 3.0
 CAMP_CROSS_RADIUS_MI = 1.5   # within this distance of camp counts as "crossing"
@@ -815,9 +815,21 @@ def cluster_and_route(students: list, vehicles: list,
                 chunk.append(u); chunk_n += len(u)
             if chunk: assignable.append(chunk)
 
+    # Sort by compass sector first (45° buckets), then farthest-first within
+    # each sector.  This ensures each vehicle builds a clean directional
+    # corridor: all NW clusters are processed together before N, then NE, etc.
+    # Previously, pure distance sorting interleaved opposite-direction clusters
+    # onto the same bus (e.g. Montgomeryville W + Castle Valley NE → Vehicle E).
+    def _bear(cl):
+        clat, clon = centroid(cl)
+        return bearing_deg(camp_lat, camp_lon, clat, clon)
+
     assignable.sort(
-        key=lambda cl: haversine_mi(*centroid(cl), camp_lat, camp_lon),
-        reverse=True)
+        key=lambda cl: (
+            int(_bear(cl) / 45),                               # 45° sector (0-7)
+            -haversine_mi(*centroid(cl), camp_lat, camp_lon),  # farthest first
+        )
+    )
 
     assignments = [[] for _ in veh_objects]
     counts = [0] * len(veh_objects)
