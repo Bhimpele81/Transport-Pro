@@ -1,0 +1,249 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Transport-Pro — How Routes Are Built</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: 'Georgia', serif;
+    font-size: 13.5px;
+    color: #1a1a1a;
+    background: #fff;
+    padding: 40px 52px;
+    max-width: 920px;
+    margin: auto;
+    line-height: 1.7;
+  }
+  header {
+    border-bottom: 3px solid #6D1F2F;
+    padding-bottom: 14px;
+    margin-bottom: 26px;
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-end;
+  }
+  header h1 {
+    font-size: 24px;
+    color: #6D1F2F;
+    letter-spacing: 0.5px;
+  }
+  header .sub {
+    font-size: 11.5px;
+    color: #666;
+    text-align: right;
+    line-height: 1.5;
+  }
+  h2 {
+    font-size: 11.5px;
+    font-family: 'Arial', sans-serif;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 1.2px;
+    color: #6D1F2F;
+    background: #F5E6E9;
+    padding: 5px 10px;
+    margin: 22px 0 12px;
+  }
+  .grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 0 36px;
+  }
+  p { margin-bottom: 9px; }
+  ul { padding-left: 18px; margin-bottom: 10px; }
+  li { margin-bottom: 5px; }
+  .step {
+    display: flex;
+    gap: 12px;
+    margin-bottom: 14px;
+    align-items: flex-start;
+  }
+  .step-num {
+    background: #6D1F2F;
+    color: #fff;
+    font-family: 'Arial', sans-serif;
+    font-weight: 700;
+    font-size: 11px;
+    min-width: 24px;
+    height: 24px;
+    border-radius: 50%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+    margin-top: 2px;
+  }
+  .step-body strong {
+    display: block;
+    font-family: 'Arial', sans-serif;
+    font-size: 12.5px;
+    margin-bottom: 3px;
+    color: #6D1F2F;
+  }
+  .principle {
+    background: #F5E6E9;
+    border-left: 4px solid #6D1F2F;
+    padding: 9px 13px;
+    margin-bottom: 10px;
+    font-family: 'Arial', sans-serif;
+    font-size: 12.5px;
+    line-height: 1.55;
+  }
+  .principle strong { color: #6D1F2F; }
+  .callout {
+    background: #fff8e1;
+    border: 1px solid #f0c040;
+    border-left: 4px solid #f0c040;
+    padding: 9px 13px;
+    font-family: 'Arial', sans-serif;
+    font-size: 12.5px;
+    margin-bottom: 10px;
+    line-height: 1.55;
+  }
+  footer {
+    border-top: 1px solid #ddd;
+    margin-top: 28px;
+    padding-top: 10px;
+    font-size: 10.5px;
+    color: #999;
+    font-family: 'Arial', sans-serif;
+    display: flex;
+    justify-content: space-between;
+  }
+  .download-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 7px;
+    background: #6D1F2F;
+    color: #fff;
+    font-family: 'Arial', sans-serif;
+    font-size: 12.5px;
+    font-weight: 600;
+    padding: 9px 18px;
+    border: none;
+    cursor: pointer;
+    letter-spacing: 0.4px;
+    margin-bottom: 28px;
+    text-decoration: none;
+  }
+  .download-btn:hover { background: #8a2638; }
+  @media print {
+    body { padding: 24px 32px; }
+    h2 { break-after: avoid; }
+    .step { break-inside: avoid; }
+    .no-print { display: none !important; }
+  }
+</style>
+</head>
+<body>
+
+<div class="no-print" style="text-align:right; margin-bottom: 10px;">
+  <button class="download-btn" onclick="window.print()">
+    <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+    Download PDF
+  </button>
+</div>
+
+<header>
+  <div>
+    <h1>Transport-Pro</h1>
+    <div style="font-size:14px; color:#6D1F2F; margin-top:3px;">How Bus Routes Are Built</div>
+  </div>
+  <div class="sub">
+    Elbow Lane Day Camp<br>
+    Warrington, PA
+  </div>
+</header>
+
+<div class="grid">
+<div>
+
+<h2>Our Core Commitments</h2>
+
+<div class="principle"><strong>Kids ride as little as possible.</strong> Every routing decision prioritizes minimizing the time a child spends on the bus — not minimizing the driver's drive.</div>
+
+<div class="principle"><strong>Farthest kids are picked up first.</strong> A child who lives 15 miles from camp should board the bus early and arrive with a reasonable ride time. A child who lives 2 miles from camp boards last and is on the bus for only a few minutes.</div>
+
+<div class="principle"><strong>Every bus stays in its own area.</strong> Buses do not zigzag across town. Each bus is assigned a geographic zone and serves only the families in that zone.</div>
+
+<div class="principle"><strong>It works for any camp, anywhere.</strong> The system is not hard-coded to specific neighborhoods. It adapts automatically to any student list, any camp location, and any size fleet.</div>
+
+<h2>What We Assume</h2>
+
+<ul>
+  <li>Each bus has a fixed home garage and a maximum number of riders</li>
+  <li>Morning routes run from home to camp; afternoon is the return trip</li>
+  <li>Students who live very close together (within about 1.5 miles) share a single stop — no bus makes two stops that are two blocks apart</li>
+  <li>Travel time estimates assume typical suburban driving speeds</li>
+  <li>A bus that would carry fewer than 60% of its seats is flagged as underutilized; completely empty buses are removed from the plan</li>
+</ul>
+
+</div>
+<div>
+
+<h2>How a Route Is Built — Step by Step</h2>
+
+<div class="step">
+  <div class="step-num">1</div>
+  <div class="step-body">
+    <strong>Map Every Address</strong>
+    Each student's home address and each driver's garage are placed on a map using GPS coordinates. This is done automatically from the uploaded student list.
+  </div>
+</div>
+
+<div class="step">
+  <div class="step-num">2</div>
+  <div class="step-body">
+    <strong>Group Neighbors Together</strong>
+    Students who live close to each other are grouped into a single shared stop. This keeps routes clean and ensures families in the same neighborhood always ride together.
+  </div>
+</div>
+
+<div class="step">
+  <div class="step-num">3</div>
+  <div class="step-body">
+    <strong>Divide the Map Into Zones</strong>
+    The system looks at where all students live relative to camp and divides the map into a wedge-shaped zone for each bus. Zone boundaries are placed at the largest natural gaps in the student population — so no boundary ever splits up a neighborhood.
+  </div>
+</div>
+
+<div class="step">
+  <div class="step-num">4</div>
+  <div class="step-body">
+    <strong>Match Each Bus to Its Zone</strong>
+    Buses are matched to zones based on where their garage is located. A bus that garages southeast of camp is assigned the southeast zone; a bus that garages north of camp gets the northern zone. This means drivers start their morning already headed in the right direction.
+  </div>
+</div>
+
+<div class="step">
+  <div class="step-num">5</div>
+  <div class="step-body">
+    <strong>Sequence Stops — Farthest First</strong>
+    Within each zone, stops are ordered from farthest from camp to closest. The bus works its way inward so that each stop added to the route brings the bus closer to camp. The last student picked up has the shortest ride.
+  </div>
+</div>
+
+<div class="step">
+  <div class="step-num">6</div>
+  <div class="step-body">
+    <strong>Clean Up Any Inefficiencies</strong>
+    A final pass checks whether any two stops could be swapped to remove a geographic detour — as long as the swap does not put a near-camp student earlier in the route.
+  </div>
+</div>
+
+<div class="callout">
+  <strong>Note on driver mileage:</strong> A driver may be routed farther to reach their first pickup stop. This is intentional — it is always better for a driver to deadhead a few extra miles than for a child to ride longer than necessary.
+</div>
+
+</div>
+</div>
+
+<footer>
+  <span>Transport-Pro &mdash; Elbow Lane Day Camp</span>
+  <span>Routes are recalculated fresh each time a new student list is uploaded</span>
+</footer>
+
+</body>
+</html>
