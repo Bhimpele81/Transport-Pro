@@ -849,19 +849,42 @@ def cluster_and_route(students: list, vehicles: list,
                 best_gap, best_start = gap, (i + 1) % len(cl_tagged)
         cl_tagged = cl_tagged[best_start:] + cl_tagged[:best_start]
 
-    # Step 3 — order vehicles by garage proximity to first cluster
-    if cl_tagged:
-        first_lat, first_lon = centroid(cl_tagged[0][2])
-    else:
-        first_lat, first_lon = camp_lat, camp_lon
-    v_order = sorted(
-        range(len(veh_objects)),
-        key=lambda i: (
-            haversine_mi(first_lat, first_lon,
-                         veh_objects[i].start_lat, veh_objects[i].start_lon),
-            -veh_objects[i].capacity,   # tiebreak: larger bus first
-        )
-    )
+    # Step 3 — match vehicles to compass sectors via garage bearing from camp.
+    #
+    # A bus travelling from its garage TO camp naturally sweeps through the
+    # area in the same compass direction as its garage.  Sorting vehicles by
+    # their garage bearing (clockwise from the first cluster's bearing) and
+    # matching them to the bearing-sorted cluster list assigns each bus to
+    # its natural home corridor:
+    #   • Philadelphia garage (SE of camp) → SE students
+    #   • Quakertown garage  (N  of camp) → N/NW students
+    #   • Richboro garage    (E  of camp) → E students
+    #
+    # Vehicles whose garages are essentially AT camp (≤ 1 mi) have no
+    # meaningful compass direction, so they fill in last, sorted by capacity.
+
+    _SAME_LOC_MI = 1.0   # garage ≤ this distance from camp → treat as "local"
+
+    def _gdist(vi):   # garage distance from camp
+        return haversine_mi(camp_lat, camp_lon,
+                            veh_objects[vi].start_lat, veh_objects[vi].start_lon)
+
+    def _gbear(vi):   # garage bearing from camp (0-360°)
+        return bearing_deg(camp_lat, camp_lon,
+                           veh_objects[vi].start_lat, veh_objects[vi].start_lon)
+
+    ref_b = cl_tagged[0][0] if cl_tagged else 0.0   # first cluster's bearing
+
+    away  = [i for i in range(len(veh_objects)) if _gdist(i) >  _SAME_LOC_MI]
+    local = [i for i in range(len(veh_objects)) if _gdist(i) <= _SAME_LOC_MI]
+
+    # Sort away-garage vehicles so the one pointing toward the first cluster
+    # goes first; remaining vehicles follow in clockwise bearing order
+    away.sort(key=lambda i: (_gbear(i) - ref_b) % 360)
+    # Local vehicles (at camp) fill remaining sectors, largest capacity first
+    local.sort(key=lambda i: -veh_objects[i].capacity)
+
+    v_order = away + local
 
     assignments   = [[] for _ in veh_objects]
     counts        = [0]  * len(veh_objects)
