@@ -354,8 +354,12 @@ def api_recalculate(job_id: str):
                 legs = route_leg_times(coord_seq)
 
                 for i, stop in enumerate(veh.stops):
-                    mins = max(1, round(legs[i]))
-                    stop.drive_time = f"{mins} min from start" if i == 0 else f"{mins} min"
+                    leg_mins = max(1, round(legs[i + 1]))  # legs[i+1] = stop_i → next stop / camp
+                    if leg_mins >= 60:
+                        hrs, rem = divmod(leg_mins, 60)
+                        stop.drive_time = f"{hrs}h {rem}m" if rem else f"{hrs}h"
+                    else:
+                        stop.drive_time = f"{leg_mins} min"
 
                 # Kids ride time excludes garage deadhead
                 kids_mins = round(sum(legs[1:]))
@@ -1309,7 +1313,7 @@ function buildResultsTab(vehicles, jobId, initEditable=true) {
             <tr class="stop-row-arrive">
               <td class="stop-num">⛳</td>
               <td class="stop-addr" colspan="2">${campAddr}<div class="stop-city">Camp — destination</div></td>
-              <td class="stop-time">${v.last_leg_mins ? v.last_leg_mins + ' min →' : '→'} ARRIVE</td>
+              <td class="stop-time">${v.total_time ? v.total_time + ' total →' : '→'} ARRIVE</td>
             </tr>
           </tbody>
         </table>

@@ -1005,16 +1005,16 @@ def cluster_and_route(students: list, vehicles: list,
         # legs[-1] = stopN->camp
         legs = route_leg_times(coord_seq, progress_cb)
 
-        # Each stop shows remaining ride time to camp from that pickup
+        # Each stop shows leg time to the next stop (or to camp for the last stop)
         for i, stop in enumerate(sorted_stops):
-            remaining = round(sum(legs[i + 1:]))
-            if remaining >= 60:
-                hrs, rem = divmod(remaining, 60)
-                stop.drive_time = f"{hrs}h {rem}m to camp" if rem else f"{hrs}h to camp"
+            leg_mins = max(1, round(legs[i + 1]))  # legs[i+1] = stop_i → stop_{i+1}
+            if leg_mins >= 60:
+                hrs, rem = divmod(leg_mins, 60)
+                stop.drive_time = f"{hrs}h {rem}m" if rem else f"{hrs}h"
             else:
-                stop.drive_time = f"{remaining} min to camp" if remaining > 0 else "< 1 min to camp"
+                stop.drive_time = f"{leg_mins} min"
 
-        # Store last leg (stopN -> camp) for arrival row display
+        # Store last leg (stopN -> camp) for reference; ARRIVE row uses total_time
         veh.last_leg_mins = max(1, round(legs[-1])) if legs else 0
 
         veh.stops = sorted_stops
