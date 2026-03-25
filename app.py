@@ -119,10 +119,6 @@ def index():
 def serve_logo():
     return send_from_directory(os.path.dirname(os.path.abspath(__file__)), "logo.png")
 
-@app.route("/methodology")
-def methodology():
-    return send_from_directory(os.path.dirname(os.path.abspath(__file__)), "route_methodology.html")
-
 @app.route("/healthz")
 def healthz():
     return "OK", 200
