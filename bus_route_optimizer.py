@@ -861,10 +861,18 @@ def cluster_and_route(students: list, vehicles: list,
             geo = x[0]
             util = 1 + counts[x[1]] / veh_objects[x[1]].capacity
             if veh_bearings[x[1]]:
+                # Vehicle has an established corridor — apply a strong quadratic
+                # penalty for deviating from it.  At 75° off it costs ~4×, at
+                # 90° it costs ~7×, making an established corridor very sticky
+                # and preventing vehicles from "stealing" clusters in a
+                # different geographic area just because they happen to be closer.
                 avg_b = sum(veh_bearings[x[1]]) / len(veh_bearings[x[1]])
-                bearing_diff = min(abs(avg_b - bearing_ref), 360 - abs(avg_b - bearing_ref))
-                bearing_penalty = 1 + bearing_diff / 180.0
+                bearing_diff = min(abs(avg_b - bearing_ref),
+                                   360 - abs(avg_b - bearing_ref))
+                bearing_penalty = (1 + bearing_diff / 45.0) ** 2
             else:
+                # Empty vehicle: compete purely on garage→cluster distance so
+                # buses anchor to their home neighbourhood first.
                 bearing_penalty = 1.0
             return geo * util * bearing_penalty
 
